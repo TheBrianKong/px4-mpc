@@ -64,14 +64,23 @@ def generate_launch_description():
         description='Publish setpoint pose via rviz'
     )
 
+    update_rotation_center_arg = DeclareLaunchArgument(
+        'update_rotation_center',
+        default_value='false',
+        description='Update the rotation center based on current pos'
+    )
+
+
     mode = LaunchConfiguration('mode')
     namespace = LaunchConfiguration('namespace')
     setpoint_from_rviz = LaunchConfiguration('setpoint_from_rviz')
+    update_rotation_center = LaunchConfiguration('update_rotation_center')
 
     return LaunchDescription([
         mode_arg,
         namespace_arg,
         setpoint_from_rviz_arg,
+        update_rotation_center_arg,
         Node(
             package='px4_mpc',
             namespace=namespace,
@@ -93,13 +102,25 @@ def generate_launch_description():
             emulate_tty=True,
             condition=IfCondition(setpoint_from_rviz)
         ),
+        # Node(
+        #     package='px4_mpc',
+        #     namespace=namespace,
+        #     executable='test_setpoints',
+        #     name='test_setpoints',
+        #     output='screen',
+        #     emulate_tty=True,
+        #     condition=UnlessCondition(setpoint_from_rviz)
+        # ),
         Node(
             package='px4_mpc',
             namespace=namespace,
-            executable='test_setpoints',
-            name='test_setpoints',
+            executable='rotating_setpoints',
+            name='rotating_setpoints',
             output='screen',
             emulate_tty=True,
+            parameters=[
+                {'update_rotation_center': update_rotation_center}
+            ],
             condition=UnlessCondition(setpoint_from_rviz)
         ),
         Node(
