@@ -100,7 +100,7 @@ class SpacecraftWrenchModel():
         # dynamics
         f_expl = cs.vertcat(v,
                             a_thrust,
-                            1 / 2 * cs.mtimes(skew_symmetric(w), q),
+                            1 / 2 * cs.mtimes(skew_symmetric(w), q), # q body to inertial, qw qx qy qz
                             np.linalg.inv(self.inertia) @ (tau - cs.cross(w, self.inertia @ w))
                             )
 
