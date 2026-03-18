@@ -11,9 +11,9 @@ class SetpointPublisher(Node):
         super().__init__('setpoint_publisher')
 
         self.namespace = self.declare_parameter('namespace', '').value
-        self.namespace_prefix = f'/{self.namespace}' if self.namespace else ''
+        self.namespace_prefix = f'/{self.namespace}/' if self.namespace else ''
 
-        self.publisher_ = self.create_publisher(PoseStamped, f'{self.namespace_prefix}/px4_mpc/setpoint_pose', 10)
+        self.publisher_ = self.create_publisher(PoseStamped, f'{self.namespace_prefix}px4_mpc/setpoint_pose', 10)
         self.timer_period = 0.01  # seconds
         time.sleep(5) # Give time for all inits...
         self.counter = 0
@@ -45,7 +45,7 @@ class SetpointPublisher(Node):
 
         if self.counter % 2000 == 0:
             self.index = (self.index + 1) % len(self.setpoints)
-            print(f"Publishing setpoint {self.index}: {self.setpoints[self.index]}")
+            print(f"Publishing setpoint {self.index}: {self.setpoints[self.index]} to {self.publisher_.topic}")
         self.counter += 1
 
 
