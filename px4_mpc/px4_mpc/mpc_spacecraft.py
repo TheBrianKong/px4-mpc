@@ -130,6 +130,12 @@ class SpacecraftMPC(Node):
     def set_publishers_subscribers(self, qos_profile_pub, qos_profile_sub):
         # Subscribe to both using the same callback
         # - depending on PX4 version, one or the other will be used, but not both
+        self.status_sub_v2 = self.create_subscription(
+            VehicleStatus,
+            'fmu/out/vehicle_status_v2',
+            self.vehicle_status_callback,
+            qos_profile_sub
+        )
         self.status_sub_v1 = self.create_subscription(
             VehicleStatus,
             'fmu/out/vehicle_status_v1',
@@ -156,6 +162,11 @@ class SpacecraftMPC(Node):
             'fmu/out/vehicle_local_position',
             self.vehicle_local_position_callback,
             qos_profile_sub)
+        self.local_position_sub_v1 = self.create_subscription(
+            VehicleLocalPosition,
+            'fmu/out/vehicle_local_position_v1',
+            self.vehicle_local_position_callback,
+            qos_profile_sub)
 
         if self.setpoint_from_rviz:
             self.set_pose_srv = self.create_service(
@@ -167,6 +178,12 @@ class SpacecraftMPC(Node):
             self.setpoint_pose_sub = self.create_subscription(
                 PoseStamped,
                 'px4_mpc/setpoint_pose',
+                self.get_setpoint_pose_callback,
+                0
+            )
+            self.setpoint_pose_sub = self.create_subscription(
+                PoseStamped,
+                '/px4_mpc/setpoint_pose',           # PRAS NOTE: I changed this because the test_setpoint.py doesnt seem to receive the namespace args and publish into topic without the namespace
                 self.get_setpoint_pose_callback,
                 0
             )
@@ -210,14 +227,14 @@ class SpacecraftMPC(Node):
     def vehicle_attitude_callback(self, msg):
         # NED-> ENU transformation
         # Receives quaternion in NED frame as (qw, qx, qy, qz)
-        self.vehicle_attitude_timestamp = Clock().now().nanoseconds / 1e9
+        self.vehicle_attitude_timestamp = self.get_clock().now().nanoseconds / 1e9
         q_enu = 1/np.sqrt(2) * np.array([msg.q[0] + msg.q[3], msg.q[1] + msg.q[2], msg.q[1] - msg.q[2], msg.q[0] - msg.q[3]])
         q_enu /= np.linalg.norm(q_enu)
         self.vehicle_attitude = q_enu.astype(float)
 
     def vehicle_local_position_callback(self, msg):
         # NED-> ENU transformation
-        self.vehicle_local_position_timestamp = Clock().now().nanoseconds / 1e9
+        self.vehicle_local_position_timestamp = self.get_clock().now().nanoseconds / 1e9
         self.vehicle_local_position[0] = msg.y
         self.vehicle_local_position[1] = msg.x
         self.vehicle_local_position[2] = -msg.z
@@ -227,22 +244,23 @@ class SpacecraftMPC(Node):
 
     def vehicle_angular_velocity_callback(self, msg):
         # NED-> ENU transformation
-        self.vehicle_angular_velocity_timestamp = Clock().now().nanoseconds / 1e9
+        self.vehicle_angular_velocity_timestamp = self.get_clock().now().nanoseconds / 1e9
         self.vehicle_angular_velocity[0] = msg.xyz[0]
         self.vehicle_angular_velocity[1] = -msg.xyz[1]
         self.vehicle_angular_velocity[2] = -msg.xyz[2]
 
     def vehicle_status_callback(self, msg):
+        # self.get_logger().info("Vehicle status received!")
         # print("NAV_STATUS: ", msg.nav_state)
         # print("  - offboard status: ", VehicleStatus.NAVIGATION_STATE_OFFBOARD)
-        self.vehicle_status_timestamp = Clock().now().nanoseconds / 1e9
+        self.vehicle_status_timestamp = self.get_clock().now().nanoseconds / 1e9
         self.nav_state = msg.nav_state
 
     def publish_reference(self, pub, reference):
         msg = Marker()
         msg.action = Marker.ADD
         msg.header.frame_id = "map"
-        # msg.header.stamp = Clock().now().nanoseconds / 1000
+        # msg.header.stamp = self.get_clock().now().nanoseconds / 1000
         msg.ns = "arrow"
         msg.id = 1
         msg.type = Marker.SPHERE
@@ -272,7 +290,7 @@ class SpacecraftMPC(Node):
         F_cmd *= F_scaling
 
         rates_setpoint_msg = VehicleRatesSetpoint()
-        rates_setpoint_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+        rates_setpoint_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         rates_setpoint_msg.roll  = float(w_cmd[0])
         rates_setpoint_msg.pitch = -float(w_cmd[1])
         rates_setpoint_msg.yaw   = -float(w_cmd[2])
@@ -292,10 +310,10 @@ class SpacecraftMPC(Node):
         u_pred[0, 2] *= T_scaling
 
         thrust_outputs_msg = VehicleThrustSetpoint()
-        thrust_outputs_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+        thrust_outputs_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
 
         torque_outputs_msg = VehicleTorqueSetpoint()
-        torque_outputs_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+        torque_outputs_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
 
         thrust_outputs_msg.xyz = [u_pred[0, 0], -u_pred[0, 1], -0.0]
         torque_outputs_msg.xyz = [0.0, -0.0, -u_pred[0, 2]]
@@ -305,7 +323,7 @@ class SpacecraftMPC(Node):
 
     def publish_direct_actuator_setpoint(self, u_pred):
         actuator_outputs_msg = ActuatorMotors()
-        actuator_outputs_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+        actuator_outputs_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
 
         # Normalize thrust values w.r.t. max thrust
         thrust = u_pred[0, :] / self.model.max_thrust
@@ -323,7 +341,7 @@ class SpacecraftMPC(Node):
         msg = Odometry()
         msg.header.frame_id = "map"
         msg.child_frame_id = "base_link"
-        msg.header.stamp = Clock().now().to_msg()
+        msg.header.stamp = self.get_clock().now().to_msg()
         msg.pose.pose.position.x = self.vehicle_local_position[0]
         msg.pose.pose.position.y = self.vehicle_local_position[1]
         msg.pose.pose.position.z = self.vehicle_local_position[2]
@@ -341,20 +359,29 @@ class SpacecraftMPC(Node):
         return
 
     def check_data_validity(self):
-        current_time = Clock().now().nanoseconds / 1e9
+        current_time = self.get_clock().now().nanoseconds / 1e9
+
+        ret_val = True
 
         # Check if the data is valid based on the timestamps
-        if (current_time - self.vehicle_attitude_timestamp > DATA_VALIDITY_STREAM or
-            current_time - self.vehicle_local_position_timestamp > DATA_VALIDITY_STREAM or
-            current_time - self.vehicle_angular_velocity_timestamp > DATA_VALIDITY_STREAM):
-            self.get_logger().warn("Vehicle attitude, position, or angular velocity data is too old. Skipping offboard control...")
-            return False
+        if (current_time - self.vehicle_attitude_timestamp > DATA_VALIDITY_STREAM):
+            self.get_logger().warn("Vehicle attitude data is too old. Skipping offboard control...")
+            self.get_logger().warn(f"Current time: {current_time}, attitude timestamp: {self.vehicle_attitude_timestamp}")
+            ret_val = False
+
+        if (current_time - self.vehicle_local_position_timestamp > DATA_VALIDITY_STREAM):
+            self.get_logger().warn("Vehicle position data is too old. Skipping offboard control...")
+            ret_val = False
+
+        if (current_time - self.vehicle_angular_velocity_timestamp > DATA_VALIDITY_STREAM):
+            self.get_logger().warn("Vehicle angular velocity data is too old. Skipping offboard control...")
+            ret_val = False
 
         if (current_time - self.vehicle_status_timestamp > DATA_VALIDITY_STATUS):
             self.get_logger().warn("Vehicle status data is too old. Skipping offboard control...")
-            return False
+            ret_val = False
 
-        return True
+        return ret_val
 
     def cmdloop_callback(self):
 
@@ -368,7 +395,7 @@ class SpacecraftMPC(Node):
 
         # Publish offboard control modes
         offboard_msg = OffboardControlMode()
-        offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+        offboard_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         offboard_msg.position = False
         offboard_msg.velocity = False
         offboard_msg.acceleration = False
