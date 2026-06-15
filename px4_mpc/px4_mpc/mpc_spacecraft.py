@@ -135,39 +135,34 @@ class SpacecraftMPC(Node):
         self.vehicle_status_timestamp = -np.inf
 
     def set_publishers_subscribers(self, qos_profile_pub, qos_profile_sub):
-        # Subscribe to both using the same callback
-        # - depending on PX4 version, one or the other will be used, but not both
-        self.status_sub_v1 = self.create_subscription(
-            VehicleStatus,
-            'fmu/out/vehicle_status_v1',
-            self.vehicle_status_callback,
-            qos_profile_sub)
-        self.status_sub = self.create_subscription(
-            VehicleStatus,
-            'fmu/out/vehicle_status',
-            self.vehicle_status_callback,
-            qos_profile_sub)
+        # Subscribe to multiple version of PX4 msg topics using the same callback
+        # - depending on PX4 version, one or the other will be used, but not all at the same time
 
+        # Vehicle Status
+        for topic in ('fmu/out/vehicle_status_v4', 'fmu/out/vehicle_status_v3',
+                    'fmu/out/vehicle_status_v2', 'fmu/out/vehicle_status_v1',
+                    'fmu/out/vehicle_status'):
+            self.create_subscription(VehicleStatus, topic, self.vehicle_status_callback, qos_profile_sub)
+        
+        # Attitude
         self.attitude_sub = self.create_subscription(
             VehicleAttitude,
             'fmu/out/vehicle_attitude',
             self.vehicle_attitude_callback,
             qos_profile_sub)
+        
+        # Angular Vel
         self.angular_vel_sub = self.create_subscription(
             VehicleAngularVelocity,
             'fmu/out/vehicle_angular_velocity',
             self.vehicle_angular_velocity_callback,
             qos_profile_sub)
-        self.local_position_sub = self.create_subscription(
-            VehicleLocalPosition,
-            'fmu/out/vehicle_local_position',
-            self.vehicle_local_position_callback,
-            qos_profile_sub)
-        self.local_position_sub = self.create_subscription(
-            VehicleLocalPosition,
-            'fmu/out/vehicle_local_position_v1',
-            self.vehicle_local_position_callback,
-            qos_profile_sub)
+        
+        # Local Position
+        for topic in ('fmu/out/vehicle_local_position', 
+                      'fmu/out/vehicle_local_position_v1'):
+            self.create_subscription(VehicleLocalPosition, topic, self.vehicle_local_position_callback, qos_profile_sub)
+        
 
         if self.setpoint_from_rviz:
             self.set_pose_srv = self.create_service(
