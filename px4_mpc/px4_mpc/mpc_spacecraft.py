@@ -135,8 +135,21 @@ class SpacecraftMPC(Node):
         self.vehicle_status_timestamp = -np.inf
 
     def set_publishers_subscribers(self, qos_profile_pub, qos_profile_sub):
-        # Subscribe to both using the same callback
-        # - depending on PX4 version, one or the other will be used, but not both
+        # Subscribe to multiple version of PX4 msg topics using the same callback
+        # - depending on PX4 version, one or the other will be used, but not all at the same time
+
+        # Vehicle Status
+        self.status_sub_v4 = self.create_subscription(
+            VehicleStatus,
+            'fmu/out/vehicle_status_v4',
+            self.vehicle_status_callback,
+            qos_profile_sub
+        )
+        self.status_sub_v2 = self.create_subscription(
+            VehicleStatus,
+            'fmu/out/vehicle_status_v2',
+            self.vehicle_status_callback,
+            qos_profile_sub)
         self.status_sub_v1 = self.create_subscription(
             VehicleStatus,
             'fmu/out/vehicle_status_v1',
@@ -147,17 +160,22 @@ class SpacecraftMPC(Node):
             'fmu/out/vehicle_status',
             self.vehicle_status_callback,
             qos_profile_sub)
-
+        
+        # Attitude
         self.attitude_sub = self.create_subscription(
             VehicleAttitude,
             'fmu/out/vehicle_attitude',
             self.vehicle_attitude_callback,
             qos_profile_sub)
+        
+        # Angular Vel
         self.angular_vel_sub = self.create_subscription(
             VehicleAngularVelocity,
             'fmu/out/vehicle_angular_velocity',
             self.vehicle_angular_velocity_callback,
             qos_profile_sub)
+        
+        # Local Position
         self.local_position_sub = self.create_subscription(
             VehicleLocalPosition,
             'fmu/out/vehicle_local_position',
