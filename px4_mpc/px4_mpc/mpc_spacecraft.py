@@ -139,27 +139,10 @@ class SpacecraftMPC(Node):
         # - depending on PX4 version, one or the other will be used, but not all at the same time
 
         # Vehicle Status
-        self.status_sub_v4 = self.create_subscription(
-            VehicleStatus,
-            'fmu/out/vehicle_status_v4',
-            self.vehicle_status_callback,
-            qos_profile_sub
-        )
-        self.status_sub_v2 = self.create_subscription(
-            VehicleStatus,
-            'fmu/out/vehicle_status_v2',
-            self.vehicle_status_callback,
-            qos_profile_sub)
-        self.status_sub_v1 = self.create_subscription(
-            VehicleStatus,
-            'fmu/out/vehicle_status_v1',
-            self.vehicle_status_callback,
-            qos_profile_sub)
-        self.status_sub = self.create_subscription(
-            VehicleStatus,
-            'fmu/out/vehicle_status',
-            self.vehicle_status_callback,
-            qos_profile_sub)
+        for topic in ('fmu/out/vehicle_status_v4', 'fmu/out/vehicle_status_v3',
+                    'fmu/out/vehicle_status_v2', 'fmu/out/vehicle_status_v1',
+                    'fmu/out/vehicle_status'):
+            self.create_subscription(VehicleStatus, topic, self.vehicle_status_callback, qos_profile_sub)
         
         # Attitude
         self.attitude_sub = self.create_subscription(
@@ -176,16 +159,10 @@ class SpacecraftMPC(Node):
             qos_profile_sub)
         
         # Local Position
-        self.local_position_sub = self.create_subscription(
-            VehicleLocalPosition,
-            'fmu/out/vehicle_local_position',
-            self.vehicle_local_position_callback,
-            qos_profile_sub)
-        self.local_position_sub = self.create_subscription(
-            VehicleLocalPosition,
-            'fmu/out/vehicle_local_position_v1',
-            self.vehicle_local_position_callback,
-            qos_profile_sub)
+        for topic in ('fmu/out/vehicle_local_position', 
+                      'fmu/out/vehicle_local_position_v1'):
+            self.create_subscription(VehicleLocalPosition, topic, self.vehicle_local_position_callback, qos_profile_sub)
+        
 
         if self.setpoint_from_rviz:
             self.set_pose_srv = self.create_service(
