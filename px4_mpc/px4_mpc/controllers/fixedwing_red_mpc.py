@@ -79,7 +79,7 @@ class FixedWingReducedMPC:
         ocp.constraints.ubx = np.array([45.0])# Max structural airspeed
         
         # make airspeed a soft constraint with slack
-        ocp.constraints.idxsbx = np.array([0]) # speed is now first item in idxbx
+        # ocp.constraints.idxsbx = np.array([0]) # speed is now first item in idxbx
         ocp.constraints.x0 = x0 # np.zeros
         ocp.constraints.lbu_0 = ocp.constraints.lbu
         ocp.constraints.ubu_0 = ocp.constraints.ubu
@@ -93,18 +93,18 @@ class FixedWingReducedMPC:
             ocp.constraints.lh = np.array([self.cbf_filter.lh])
             ocp.constraints.uh = np.array([self.cbf_filter.uh])
             # make h a soft constraint
-            ocp.constraints.idxsh = np.array([0])
+            # ocp.constraints.idxsh = np.array([0])
             # in this case we have two soft contraints
-            ocp.cost.zl = np.array([1e5, 1e5]) # linear penalty
-            ocp.cost.zu = np.array([1e5, 1e5])
-            ocp.cost.Zl = np.array([1e6, 1e6]) # quadratic penalty
-            ocp.cost.Zu = np.array([1e6, 1e6])
+            # ocp.cost.zl = np.array([1e5, 1e5]) # linear penalty
+            # ocp.cost.zu = np.array([1e5, 1e5])
+            # ocp.cost.Zl = np.array([1e6, 1e6]) # quadratic penalty
+            # ocp.cost.Zu = np.array([1e6, 1e6])
         else:
             print("Warning: No CBF safety filter provided to MPC cost.")
-            ocp.cost.zl = np.array([1e5]) # linear penalty (lower bound)
-            ocp.cost.zu = np.array([1e5]) # linear penalty (upper bound)
-            ocp.cost.Zl = np.array([1e5]) # quadratic penalty
-            ocp.cost.Zu = np.array([1e5])
+            # ocp.cost.zl = np.array([1e5]) # linear penalty (lower bound)
+            # ocp.cost.zu = np.array([1e5]) # linear penalty (upper bound)
+            # ocp.cost.Zl = np.array([1e5]) # quadratic penalty
+            # ocp.cost.Zu = np.array([1e5])
 
         # SOLVER OPTIONS
         ocp.solver_options.tf = self.Tf
