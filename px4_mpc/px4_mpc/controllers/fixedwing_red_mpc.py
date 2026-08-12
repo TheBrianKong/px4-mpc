@@ -92,7 +92,7 @@ class FixedWingReducedMPC:
             ocp.model.con_h_expr = cs.vertcat(cbf_expr)  # Add the CBF constraint to the model
             ocp.constraints.lh = np.array([self.cbf_filter.lh])
             ocp.constraints.uh = np.array([self.cbf_filter.uh])
-            # make h a soft constraint
+            # uncomment l96~107 to make h and speed a soft constraint (for debugging only)
             # ocp.constraints.idxsh = np.array([0])
             # in this case we have two soft contraints
             # ocp.cost.zl = np.array([1e5, 1e5]) # linear penalty
