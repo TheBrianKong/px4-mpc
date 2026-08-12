@@ -124,7 +124,7 @@ class FixedWingReducedMPC:
 
         return ocp_solver, acados_integrator
     
-    def solve(self, x0, yref_trajectory, verbose=True):
+    def solve(self, x0, yref_trajectory, u_warm_start=None,verbose=True):
         """
         Receives the receding horizon trajectory (N+1 points) and updates the solver.
         """
@@ -137,6 +137,9 @@ class FixedWingReducedMPC:
         u_target =np.array([0.0, 9.81, 0.0])
         for i in range(self.N):
             ocp_solver.set(i, "yref", np.concatenate([yref_trajectory[i],u_target]))
+            # maybe having an if statement in a for loop is bad for compute
+            if u_warm_start is not None: 
+                ocp_solver.set(i,"u",u_warm_start[i,:])
         ocp_solver.set(self.N, "yref", yref_trajectory[self.N])
 
         status = ocp_solver.solve()
