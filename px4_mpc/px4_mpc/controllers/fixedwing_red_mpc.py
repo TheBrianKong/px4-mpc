@@ -50,7 +50,7 @@ class FixedWingReducedMPC:
         Q_pos = np.diag([5e2, 5e2, 1e3, 0.0, 0, 0, 0, 0])
         Q_mat = Q_all if trackingAttitude else Q_pos
         # u: [thrust, lift, roll_rate]
-        R_mat = np.diag([5e2, 5e2, 1e3])    # Control effort penalties
+        R_mat = np.diag([5e2, 5e2, 1e4])    # Control effort penalties
         # weights in a block diagonal matrix
         ocp.cost.W = np.block([ [Q_mat, np.zeros((Q_mat.shape[0], R_mat.shape[1]))],
                                 [np.zeros((R_mat.shape[0], Q_mat.shape[1])), R_mat] ])
@@ -87,7 +87,7 @@ class FixedWingReducedMPC:
         
         # this is if i implemented cbf into the cost function
         
-        if self.cbf_filter is not None and hasattr(self.cbf_filter, 'get_cbf_expr'):
+        if self.cbf_filter is not None:
             cbf_expr = self.cbf_filter.get_cbf_expr(ocp.model.x, ocp.model.u)
             ocp.model.con_h_expr = cs.vertcat(cbf_expr)  # Add the CBF constraint to the model
             ocp.constraints.lh = np.array([self.cbf_filter.lh])
@@ -120,11 +120,15 @@ class FixedWingReducedMPC:
         # ocp.solver_options.sim_method_jac_reuse = 1
         ocp.solver_options.qp_solver_cond_N = self.N
         ocp_solver = AcadosOcpSolver(ocp, json_file=json_path)
+        
+        ocp.solver_options.qp_solver_warm_start = 2
+        # ocp.solver_options.nlp_solver_warm_start_first_qp = True
+        
         acados_integrator = AcadosSimSolver(ocp, json_file=json_path)
 
         return ocp_solver, acados_integrator
     
-    def solve(self, x0, yref_trajectory, u_warm_start=None,verbose=True):
+    def solve(self, x0, yref_trajectory, x_warm_start=None, u_warm_start=None,verbose=True):
         """
         Receives the receding horizon trajectory (N+1 points) and updates the solver.
         """
@@ -134,14 +138,19 @@ class FixedWingReducedMPC:
         ocp_solver.set(0, "ubx", x0)
 
         # inject lookahead trajectory
-        u_target =np.array([0.0, 9.81, 0.0])
-        for i in range(self.N):
-            ocp_solver.set(i, "yref", np.concatenate([yref_trajectory[i],u_target]))
-            # maybe having an if statement in a for loop is bad for compute
-            if u_warm_start is not None: 
-                ocp_solver.set(i,"u",u_warm_start[i,:])
+        if u_warm_start is not None and x_warm_start is not None:
+            for i in range(self.N):
+                u_val = u_warm_start[i, :]
+                x_val = x_warm_start[i,:]
+                ocp_solver.set(i, "u", u_val)
+                ocp_solver.set(i, "x", x_val)
+                ocp_solver.set(i, "yref", np.concatenate([yref_trajectory[i], u_val]))
+        else:
+            u_fallback = np.array([0.0, 9.81, 0.0])
+            for i in range(self.N):
+                ocp_solver.set(i, "yref", np.concatenate([yref_trajectory[i], u_fallback]))
         ocp_solver.set(self.N, "yref", yref_trajectory[self.N])
-
+        
         status = ocp_solver.solve()
 
         if status != 0:

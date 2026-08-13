@@ -137,7 +137,7 @@ def run_closed_loop_mpc(verbose = False):
     filter_mode = "HOCBF"
     alpha1 = 1.0
     alpha2 = 1.0
-    
+    filter_max_iter = 5
     
     # initialize slightly off the path in z-up frame
     x0 = np.zeros(8)
@@ -158,10 +158,16 @@ def run_closed_loop_mpc(verbose = False):
     X_pred_hist = np.zeros((max_sim_steps, mpc.N + 1, mpc.nx))
     Ref_hist = np.zeros((max_sim_steps, mpc.N + 1, mpc.nx))
     shield_hist = np.zeros(max_sim_steps, dtype=bool)
-    compute_times = np.zeros(max_sim_steps)
+    t_compute_mpc = np.zeros(max_sim_steps)
+    t_compute_filter = np.zeros(max_sim_steps)
     
     x_curr = x0.copy()
-    u_safe_guess = np.zeros((mpc.N,mpc.nu))
+    # for warm-start of rollout
+    hover_u = np.array([0.0, model.gravity, 0.0])
+    u_safe_guess = np.tile(hover_u, (mpc.N, 1))
+    x_safe_guess = np.tile(x0, (mpc.N + 1, 1))
+    # u_safe_guess = np.zeros((mpc.N,mpc.nu))
+    # x_safe_guess = np.zeros((mpc.N + 1, mpc.nx)) # includes terminal step
     last_closest_idx = 0 
     fail_idx = None
     
@@ -170,9 +176,6 @@ def run_closed_loop_mpc(verbose = False):
     
     k = 0 
     while k < max_sim_steps:
-        # get reference time
-        t_start = time.perf_counter()
-        
         ref_slice, closest_idx, path_exhausted = get_paced_reference(
             x_curr, global_path, last_closest_idx, 
             mpc.nx, mpc.N, mpc.Ts, target_velocity
@@ -183,17 +186,22 @@ def run_closed_loop_mpc(verbose = False):
             print(f"mission complete: reached the end of the path buffer at step {k}")
             break
         
-        # solve mpc and store predicted path
-        simU, simX, solver_status = mpc.solve(x_curr, ref_slice,u_safe_guess)
-        X_pred_hist[k, :, :] = simX
+        # get reference time
+        t_start = time.perf_counter()
         
+        # solve mpc and store predicted path
+        simU, simX, solver_status = mpc.solve(x_curr, ref_slice,x_safe_guess, u_safe_guess)
+        X_pred_hist[k, :, :] = simX
+        t_end = time.perf_counter()
+        t_compute_mpc[k] = (t_end - t_start) * 1000.0 # in ms
+
         if solver_status != 0:
             print(f"Optimizer mathematically crashed at step {k}. Halting.")
             fail_idx = k
             break
-            
+        t_start = time.perf_counter()
         if cbf_filter is not None and use_filter:
-            u_filter_horizon,shield_active = cbf_filter.filter_horizon(simX, simU, 6, 5.0)
+            u_filter_horizon,shield_active = cbf_filter.filter_horizon(simX, simU, filter_max_iter)
             u_filter = u_filter_horizon[0, :]
             shield_hist[k] = shield_active
             if shield_active and verbose:
@@ -207,10 +215,13 @@ def run_closed_loop_mpc(verbose = False):
             
             u_safe_guess[:-1, :] = simU[1:, :]
             u_safe_guess[-1, :]  = simU[-1, :]
-        # plant simulation doesn't count toward time
-        t_end = time.perf_counter()
-        compute_times[k] = (t_end - t_start) * 1000.0 # in ms
+        x_safe_guess[:-1, :] = simX[1:, :]
+        x_safe_guess[-1, :]  = simX[-1, :]
         
+        t_end = time.perf_counter()
+        t_compute_filter[k] = (t_end - t_start) * 1000.0 # in ms
+        
+        # plant simulation doesn't count toward time
         
         # simulate plant forward
         mpc.integrator.set("x", x_curr)
@@ -238,8 +249,9 @@ def run_closed_loop_mpc(verbose = False):
     U_hist = U_hist[:k, :]
     X_pred_hist = X_pred_hist[:k, :, :]
     shield_hist = shield_hist[:k]
-    compute_times = compute_times[:k]
-    plot_compute_times(k, compute_times, shield_hist, mpc.Ts)
+    t_compute_mpc = t_compute_mpc[:k]
+    t_compute_filter = t_compute_filter[:k]
+    plot_compute_times(k, t_compute_mpc, t_compute_filter, shield_hist,mpc.Ts)
     plot_mpc_results(k, X_hist, U_hist, X_pred_hist,Ref_hist, 
                      global_path, mpc.Ts, model, cbf_filter, fail_idx, shield_hist)
 
@@ -501,30 +513,31 @@ def plot_mpc_results(N, X, U, X_pred, ref_slice,
     
     plt.show()
 
-def plot_compute_times(N, compute_times_ms, shield_log, dt):
-    """plot loop time in separate window"""
+def plot_compute_times(N, mpc_times_ms, filter_times_ms, shield_hist, dt):
+    """plot loop time in separate window using a stacked bar chart"""
     t = np.arange(N) * dt
     
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(12, 5))
     fig.canvas.manager.set_window_title("Real-Time Performance Profiler")
     
-    # Plot nominal loop times in blue
-    ax.plot(t, compute_times_ms, 'b.-', markersize=4, label='Total Loop Time (MPC + Filter)', alpha=0.7)
+    # Set the bar width to fill most of the timestep without overlapping
+    bar_w = dt 
+    ax.bar(t, mpc_times_ms, width=bar_w, color='dodgerblue', alpha=0.8, label='MPC (Acados) Time')
+    # stack filter compute time on top of mpc compute time
+    ax.bar(t, filter_times_ms, bottom=mpc_times_ms, width=bar_w, color='darkorange', alpha=0.9, label='Shield (CasADi) Time')
+    if shield_hist is not None and np.any(shield_hist):
+        ax.plot(t[shield_hist], t[shield_hist]*0.0+0.1, 'rs', markersize=5, label='Shield Triggered')
     
-    # Highlight shield activations in red
-    if shield_log is not None and np.any(shield_log):
-        ax.plot(t[shield_log], compute_times_ms[shield_log], 'ro', markersize=6, label='Shield Triggered')
-        
-    # Draw the strict real-time deadline
-    ax.axhline(y:=20, color='r', linestyle='--', linewidth=2, label=f'({y} ms)')
+    # 50Hz objective line
+    ax.axhline(y=20, color='red', linestyle='--', linewidth=1.5, alpha=0.6,label="50 Hz Target")
     
     ax.set_xlabel('Simulation Time (s)')
     ax.set_ylabel('Execution Time (ms)')
-    ax.set_title('Compute Overhead?')
-    ax.grid(True)
+    ax.set_title('Compute Overhead')
+    
+    # Only show horizontal grid lines for clean bar-chart reading
+    ax.grid(True, axis='y', linestyle='-', alpha=0.3)
     ax.legend(loc='upper right')
     
-    # Do NOT call plt.show() here, let the main script handle it so both windows open together!
-
 if __name__ == "__main__":
     run_closed_loop_mpc()

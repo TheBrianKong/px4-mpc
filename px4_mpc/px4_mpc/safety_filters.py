@@ -1,5 +1,5 @@
 import casadi as cs
-
+import numpy as np
 class CBFSafetyFilter:
     def __init__(self, model, filter_mode ="HOCBF", vmin=1.0, gamma1=2.0, gamma2=2.0):
         self.model = model
@@ -11,8 +11,8 @@ class CBFSafetyFilter:
         self.lh = 0.1
         self.uh = 1e5
         # might want to offload section into a function
-        x_sym = cs.MX.sym('x', 8)
-        u_sym = cs.MX.sym('u', 3)
+        x_sym = cs.SX.sym('x', 8)
+        u_sym = cs.SX.sym('u', 3)
         
         speed = x_sym[3]
         q = x_sym[4:8]
@@ -106,7 +106,6 @@ class CBFSafetyFilter:
             raise ValueError(f"Unknown filter_mode: {self.filter_mode}")
             
         return cbf_val
-        
 
     def evaluate_cbf(self, x_val, u_val):
         """
@@ -119,38 +118,51 @@ class CBFSafetyFilter:
         h, h_dot, cbf_val = self._eval_func(x_val, u_val)
         # not  sure if i have to typecast, but it's safe
         return float(h), float(h_dot), float(cbf_val)
-    
-    def filter_horizon(self, X_seq, U_seq, max_iters=50, learning_rate=5.0):
+        
+    def filter_horizon(self, X_seq, U_seq, max_iters=10):
         """
         Iterate over the entire MPC predictive horizon. 
-        Use CasADi gradients to pull unsafe control actions back into the safe envelope.
+        Use CasADi gradients to pull/project unsafe control actions back into the safe envelope.
+        gradient descent with adaptive step size for rapid convergence
+        
+        Returns:
+            U_eval (np.ndarray)
+            shield_activated (bool)
         """
-        U_safe = cs.DM(U_seq)
+        
+        N = U_seq.shape[0]
+        # lazy build of mapped casadi function to allow evaluation of N inputs simultaneously in C++
+        if getattr(self, '_map_N', None) != N:
+            self._grad_func_map = self._grad_func.map(N)
+            self._map_N = N
+        # load into casadi dense mats once
+        X_eval = cs.DM(X_seq[:-1]).T  # 8 by N
+        U_eval = cs.DM(U_seq).T  # 8 by N
+        # speed up clipping by pre-extracting bounds
+        min_b = cs.DM([self.model.min_fxw, self.model.min_fzw, -self.model.max_roll_rate])
+        max_b = cs.DM([self.model.max_fxw, self.model.max_fzw, self.model.max_roll_rate])
+        
+        # stretches the 3x1 bounds into 3xN matrices to vectorize clip
+        min_bounds = cs.repmat(min_b, 1, N)
+        max_bounds = cs.repmat(max_b, 1, N)
+        
         shield_activated = False
         for iteration in range(max_iters):
-            total_penalty = 0.0
+            # evaluate using with casadi
+            pen_vals, grad_vals = self._grad_func_map(X_eval, U_eval)
             
-            for k in range(U_safe.shape[0]):
-                x_k = X_seq[k]
-                # extract control at time step k: 1x3 → 3x1 col vector
-                u_k = U_safe[k,:].T 
-                
-                # eval casadi gradient
-                pen_val, grad_val = self._grad_func(x_k, u_k)
-                total_penalty += float(pen_val)
-                
-                if float(pen_val) > 0:
-                    shield_activated = True
-                    # gradient away from the danger zone
-                    # may have to check for NaN or Inf values in grad_val
-                    U_safe[k, :] -= learning_rate * grad_val.T  # transpose to match the shape of U_safe[k]
-                    
-                    # ensure filter outputs are constrained within the control bounds
-                    U_safe[k, 0] = cs.fmin(cs.fmax(U_safe[k, 0], self.model.min_fxw), self.model.max_fxw)
-                    U_safe[k, 1] = cs.fmin(cs.fmax(U_safe[k, 1], self.model.min_fzw), self.model.max_fzw)
-                    U_safe[k, 2] = cs.fmin(cs.fmax(U_safe[k, 2], -self.model.max_roll_rate), self.model.max_roll_rate)
-            
-            # if the entire horizon is safe, stop iterating early to save CPU
+            # sum penalties across horizon into scalar
+            total_penalty = float(cs.sum(pen_vals))
             if total_penalty < 1e-3:
                 break
-        return U_safe.full(), shield_activated
+            shield_activated = True
+            # unit direction of gradient using 2-norm w/ safety
+            unit_grad = grad_vals/ cs.repmat(cs.sqrt(cs.sum1(grad_vals**2))+1e-6, 3,1)
+
+            step_size = 20.0* cs.sqrt(2.0 * pen_vals)
+            U_eval -= unit_grad * cs.repmat(step_size, 3, 1)        
+            U_eval = cs.fmin(cs.fmax(U_eval, min_bounds), max_bounds)
+        # only translate back to NumPy at the very end to pass to the rest of stack
+        else: # trigger if loop finishes without hitting the break condition
+            print(f"Filter hit max iterations ({max_iters}). Total residual penalty: {total_penalty:.4f}")
+        return np.array(U_eval.T), shield_activated
