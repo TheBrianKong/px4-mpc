@@ -2,16 +2,18 @@ import casadi as cs
 import numpy as np
 import time
 class CBFSafetyFilter:
-    def __init__(self, model, filter_mode ="HOCBF", vmin=1.0, gamma1=2.0, gamma2=2.0):
+    def __init__(self, model, filter_mode ="HOCBF", vmin=1.0, gamma1=2.0, gamma2=2.0,beta=5.0,max_iters=10):
         self.model = model
         self.vmin = vmin
         self.filter_mode= filter_mode
         self.gamma1 = gamma1
         self.gamma2 = gamma2
+        self.max_iters = max_iters
+        self.beta = beta # zeno's paradox
+        
         # hyperparams for CBF bounds
         self.lh = 0.1
         self.uh = 1e5
-        
         x_sym = cs.SX.sym('x', 8)
         u_sym = cs.SX.sym('u', 3)
         
@@ -133,7 +135,7 @@ class CBFSafetyFilter:
         # not  sure if i have to typecast, but it's safe
         return float(h), float(h_dot), float(cbf_val)
         
-    def filter_horizon(self, X_seq, U_seq, max_iters=10):
+    def filter_horizon(self, X_seq, U_seq):
         """
         Iterate over the entire MPC predictive horizon. 
         Use CasADi gradients to pull/project unsafe control actions back into the safe envelope.
@@ -180,11 +182,11 @@ class CBFSafetyFilter:
             return np.array(self._U_eval.T),False
         # print(f"[Shield] Triggered! P_I: {total_penalty:2.3e} ", end="")
         prev_penalty = float('inf')
-        beta = 5.0 # zeno's paradox
-        for iteration in range(max_iters):
+        beta = self.beta
+        for iteration in range(self.max_iters):
             # exact projection back onto boundary of safe set:  u* - u_nom = v/(\| grad h \|^2) * grad h
             if abs (prev_penalty - total_penalty) <1e-9:
-                print(f"HARDWARE LIMIT: P_F: {total_penalty:2.3e} P_prev: {prev_penalty:2.3e}\t| {iteration+1:3d}/{max_iters} iters")
+                print(f"HARDWARE LIMIT: P_F: {total_penalty:2.3e} P_prev: {prev_penalty:2.3e}\t| {iteration+1:3d}/{self.max_iters} iters")
                 break
             prev_penalty = total_penalty
             self._U_eval -= grad_vals * cs.repmat(grad_step*beta,3,1)
@@ -202,7 +204,7 @@ class CBFSafetyFilter:
             self.last_perf_breakdown["ms_loop"] = (t4-t3) * 1000.0
             self.last_perf_breakdown["iters"] = iteration + 1
             
-        else:
-            print(f"P_F: {total_penalty:2.3e}| MAX ITER REACHED")
+        # else:
+            # print(f"P_F: {total_penalty:2.3e}| MAX ITER REACHED")
         # only translate back to NumPy at the very end to pass to the rest of stack
         return np.array(self._U_eval.T), True
