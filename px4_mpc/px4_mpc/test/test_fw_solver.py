@@ -7,8 +7,8 @@ import os
 import time
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # import models and controllers using absolute ros 2 package paths
-from models.fixedwing_red_model import FixedWingReducedModel
-from controllers.fixedwing_red_mpc import FixedWingReducedMPC
+from models.fixedwing_model import FixedWingModel
+from controllers.fixedwing_mpc import FixedWingMPC
 from px4_mpc.safety_filters import CBFSafetyFilter
 
 def quat_to_R(q):
@@ -126,7 +126,7 @@ def get_paced_reference(current_state, path, last_idx, nx, N, dt, target_v):
 
 def run_closed_loop_mpc(verbose = False):
     """main simulation loop handling the mpc solver and acados plant integrator"""
-    model = FixedWingReducedModel()
+    model = FixedWingModel()
     N_horizon = 50
     max_sim_steps = 4000 
     Ts = 0.05
@@ -135,10 +135,9 @@ def run_closed_loop_mpc(verbose = False):
     use_filter= True
     v_min = 10.0
     filter_mode = "HOCBF"
-    alpha1 = 1.0
-    alpha2 = 1.0
-    filter_max_iter = 5
-    
+    gamma1 = 0.5
+    gamma2 = 0.5
+    filter_max_iter = 100
     # initialize slightly off the path in z-up frame
     x0 = np.zeros(8)
     density = 5000
@@ -148,9 +147,8 @@ def run_closed_loop_mpc(verbose = False):
     x0[0:3] = global_path[0] 
     x0[3] = target_velocity
     x0[4] = 1.0 
-    cbf_filter = None  # Set to None to disable CBF safety filter
-    cbf_filter = CBFSafetyFilter(model, filter_mode, v_min, alpha1, alpha2)
-    mpc = FixedWingReducedMPC(model, cbf_filter=cbf_filter, x0_init=x0, N=N_horizon, Ts=Ts, trackingAttitude=True)
+    cbf_filter = CBFSafetyFilter(model, filter_mode, v_min, gamma1, gamma2)
+    mpc = FixedWingMPC(model, cbf_filter=cbf_filter, x0_init=x0, N=N_horizon, Ts=Ts, trackingAttitude=True)
     
     # preallocate logging arrays
     X_hist = np.zeros((max_sim_steps, mpc.nx))
@@ -158,9 +156,16 @@ def run_closed_loop_mpc(verbose = False):
     X_pred_hist = np.zeros((max_sim_steps, mpc.N + 1, mpc.nx))
     Ref_hist = np.zeros((max_sim_steps, mpc.N + 1, mpc.nx))
     shield_hist = np.zeros(max_sim_steps, dtype=bool)
-    t_compute_mpc = np.zeros(max_sim_steps)
-    t_compute_filter = np.zeros(max_sim_steps)
     
+    perf_logs = {
+        "ms_mpc": np.zeros(max_sim_steps),
+        "ms_filter": np.zeros(max_sim_steps),
+        "ms_attr_check": np.zeros(max_sim_steps),
+        "ms_copy": np.zeros(max_sim_steps),
+        "ms_map": np.zeros(max_sim_steps),
+        "ms_loop": np.zeros(max_sim_steps),
+        "iters": np.zeros(max_sim_steps, dtype=int)
+    }    
     x_curr = x0.copy()
     # for warm-start of rollout
     hover_u = np.array([0.0, model.gravity, 0.0])
@@ -173,7 +178,8 @@ def run_closed_loop_mpc(verbose = False):
     
     print(f"generated path with {len(global_path)} waypoints")
     print("starting closed-loop paced mpc simulation")
-    
+    import gc # garbage collector causes a 20 ms spike
+    gc.disable()
     k = 0 
     while k < max_sim_steps:
         ref_slice, closest_idx, path_exhausted = get_paced_reference(
@@ -193,13 +199,15 @@ def run_closed_loop_mpc(verbose = False):
         simU, simX, solver_status = mpc.solve(x_curr, ref_slice,x_safe_guess, u_safe_guess)
         X_pred_hist[k, :, :] = simX
         t_end = time.perf_counter()
-        t_compute_mpc[k] = (t_end - t_start) * 1000.0 # in ms
+        perf_logs["ms_mpc"][k] = (t_end - t_start) * 1000.0 # in ms
 
         if solver_status != 0:
             print(f"Optimizer mathematically crashed at step {k}. Halting.")
             fail_idx = k
             break
-        t_start = time.perf_counter()
+        
+        t_filter_call = time.perf_counter()
+        
         if cbf_filter is not None and use_filter:
             u_filter_horizon,shield_active = cbf_filter.filter_horizon(simX, simU, filter_max_iter)
             u_filter = u_filter_horizon[0, :]
@@ -208,18 +216,26 @@ def run_closed_loop_mpc(verbose = False):
                 print(f"CBF safety filter activated at step {k}")
             
             u_safe_guess[:-1, :] = u_filter_horizon[1:, :]
-            u_safe_guess[-1, :]  = u_filter_horizon[-1, :]
+            u_safe_guess[ -1, :] = u_filter_horizon[-1, :]
+            
+            filter_log = cbf_filter.last_perf_breakdown
+            perf_logs["ms_attr_check"][k] = filter_log["ms_attr_check"]
+            perf_logs["ms_copy"][k] = filter_log["ms_copy"]
+            perf_logs["ms_map"][k]  = filter_log["ms_map"]
+            perf_logs["ms_loop"][k] = filter_log["ms_loop"]
+            perf_logs["iters"][k]   = filter_log["iters"]
         else:
             u_filter = simU[0, :]
             shield_hist[k] = False
             
             u_safe_guess[:-1, :] = simU[1:, :]
-            u_safe_guess[-1, :]  = simU[-1, :]
-        x_safe_guess[:-1, :] = simX[1:, :]
-        x_safe_guess[-1, :]  = simX[-1, :]
+            u_safe_guess[ -1, :] = simU[-1, :]
         
-        t_end = time.perf_counter()
-        t_compute_filter[k] = (t_end - t_start) * 1000.0 # in ms
+        x_safe_guess[:-1, :] = simX[1:, :]
+        x_safe_guess[ -1, :] = simX[-1, :]
+        t_filter_end = time.perf_counter()
+        
+        perf_logs["ms_filter"][k] = (t_filter_end - t_filter_call) * 1000.0 # in ms
         
         # plant simulation doesn't count toward time
         
@@ -243,15 +259,16 @@ def run_closed_loop_mpc(verbose = False):
         k += 1
 
     print("simulation execution finished")
-    
+    gc.enable()
     # slice history arrays to match the actual timeline of the simulation
     X_hist = X_hist[:k, :]
     U_hist = U_hist[:k, :]
     X_pred_hist = X_pred_hist[:k, :, :]
     shield_hist = shield_hist[:k]
-    t_compute_mpc = t_compute_mpc[:k]
-    t_compute_filter = t_compute_filter[:k]
-    plot_compute_times(k, t_compute_mpc, t_compute_filter, shield_hist,mpc.Ts)
+    for key in perf_logs:
+        perf_logs[key]= perf_logs[key][:k]
+    
+    plot_compute_times(k, perf_logs, shield_hist,mpc.Ts)
     plot_mpc_results(k, X_hist, U_hist, X_pred_hist,Ref_hist, 
                      global_path, mpc.Ts, model, cbf_filter, fail_idx, shield_hist)
 
@@ -285,9 +302,9 @@ def setup_control_subplots(fig, gs, col_idx, t, U, model_obj, shield_log=None):
     if shield_log is not None and np.any(shield_log):
         # use transform=ax.get_xaxis_transform() and y-values 0 to 1 
         # to shade the entire vertical height of the graph regardless of data scale!
-        ax_fxw.fill_between(t, 0, 1, where=shield_log, color='red', alpha=0.15, transform=ax_fxw.get_xaxis_transform(), label='Filter Active')
-        ax_fzw.fill_between(t, 0, 1, where=shield_log, color='red', alpha=0.15, transform=ax_fzw.get_xaxis_transform())
-        ax_roll.fill_between(t, 0, 1, where=shield_log, color='red', alpha=0.15, transform=ax_roll.get_xaxis_transform())
+        ax_fxw.fill_between(t, 0, 1, where=shield_log, color='red',edgecolor='none', alpha=0.15, transform=ax_fxw.get_xaxis_transform(), label='Filter Active')
+        ax_fzw.fill_between(t, 0, 1, where=shield_log, color='red',edgecolor='none', alpha=0.15, transform=ax_fzw.get_xaxis_transform())
+        ax_roll.fill_between(t, 0, 1, where=shield_log, color='red',edgecolor='none', alpha=0.15, transform=ax_roll.get_xaxis_transform())
         ax_fxw.legend(loc='upper right', fontsize='small')
 
     vline_fxw = ax_fxw.axvline(x=t[0], color='magenta', linestyle='--', linewidth=1.5)
@@ -296,7 +313,7 @@ def setup_control_subplots(fig, gs, col_idx, t, U, model_obj, shield_log=None):
     
     return [vline_fxw, vline_fzw, vline_roll]
 
-def setup_safety_subplots(fig, gs, col_idx, t, X, U, cbf_filter,shield_log=None):
+def setup_safety_subplots(fig, gs, col_idx, t, X, U, cbf_obj,shield_log=None):
     """builds the 3 safety metrics subplots in the specified gridspec column and returns their vertical lines"""
     N = len(t)
     h_log = np.zeros(N)
@@ -304,7 +321,7 @@ def setup_safety_subplots(fig, gs, col_idx, t, X, U, cbf_filter,shield_log=None)
     cbf_val_log = np.zeros(N)
     
     for k in range(N):
-        h, h_dot, cbf_val = cbf_filter.evaluate_cbf(X[k], U[k])
+        h, h_dot, cbf_val = cbf_obj.evaluate_cbf(X[k], U[k])
         h_log[k] = h
         h_dot_log[k] = h_dot
         cbf_val_log[k] = cbf_val
@@ -313,20 +330,20 @@ def setup_safety_subplots(fig, gs, col_idx, t, X, U, cbf_filter,shield_log=None)
     ax_margin = fig.add_subplot(gs[1, col_idx], sharex=ax_speed)
     ax_cbf = fig.add_subplot(gs[2, col_idx], sharex=ax_speed)
     
-    ax_speed.plot(t, X[:, 3], 'b-', label='actual airspeed', linewidth=2)
-    ax_speed.axhline(y=cbf_filter.vmin, color='r', linestyle='--', label='vmin (stall limit)')
+    ax_speed.plot(t, X[:, 3], 'b-', label='actual airspeed')
+    ax_speed.axhline(y=cbf_obj.vmin, color='r', linestyle='--', label='vmin (stall limit)')
     ax_speed.set_ylabel('airspeed (m/s)')
-    ax_speed.set_title('airspeed CBF stats')
+    ax_speed.set_title(f'airspeed CBF stats ($\\gamma_1 = {cbf_obj.gamma1}$, $\\gamma_2 = {cbf_obj.gamma2}$)')
     ax_speed.grid(True)
     ax_speed.legend(loc='upper right', fontsize='small')
     
-    ax_margin.plot(t, h_log, 'g-', label='h(x) = v_a - vmin', linewidth=2)
+    ax_margin.plot(t, h_log, 'g-', label='h(x) = v_a - vmin')
     ax_margin.axhline(y=0.0, color='r', linestyle='-', alpha=0.5)
     ax_margin.set_ylabel('safety margin h(x)')
     ax_margin.grid(True)
     ax_margin.legend(loc='upper right', fontsize='small')
     
-    ax_cbf.plot(t, cbf_val_log, 'k-', label='cbf condition', linewidth=2)
+    ax_cbf.plot(t, cbf_val_log, 'k-', label='cbf condition')
     ax_cbf.axhline(y=0.0, color='r', linestyle='-', alpha=0.8, label='violation (< 0)')
     ax_cbf.set_ylabel('h_dot + gamma*h')
     ax_cbf.set_xlabel('time (s)')
@@ -336,9 +353,9 @@ def setup_safety_subplots(fig, gs, col_idx, t, X, U, cbf_filter,shield_log=None)
     if shield_log is not None and np.any(shield_log):
             # use transform=ax.get_xaxis_transform() and y-values 0 to 1 
             # to shade the entire vertical height of the graph regardless of data scale!
-            ax_speed.fill_between(t, 0, 1, where=shield_log, color='red', alpha=0.15, transform=ax_speed.get_xaxis_transform(), label='Filter Active')
-            ax_margin.fill_between(t, 0, 1, where=shield_log, color='red', alpha=0.15, transform=ax_margin.get_xaxis_transform())
-            ax_cbf.fill_between(t, 0, 1, where=shield_log, color='red', alpha=0.15, transform=ax_cbf.get_xaxis_transform())
+            ax_speed.fill_between(t, 0, 1, where=shield_log, color='red',edgecolor='none', alpha=0.15, transform=ax_speed.get_xaxis_transform(), label='Filter Active')
+            ax_margin.fill_between(t, 0, 1, where=shield_log, color='red',edgecolor='none', alpha=0.15, transform=ax_margin.get_xaxis_transform())
+            ax_cbf.fill_between(t, 0, 1, where=shield_log, color='red',edgecolor='none', alpha=0.15, transform=ax_cbf.get_xaxis_transform())
             ax_speed.legend(loc='upper right', fontsize='small')
     
     vline_speed = ax_speed.axvline(x=t[0], color='magenta', linestyle='--', linewidth=1.5)
@@ -513,31 +530,53 @@ def plot_mpc_results(N, X, U, X_pred, ref_slice,
     
     plt.show()
 
-def plot_compute_times(N, mpc_times_ms, filter_times_ms, shield_hist, dt):
-    """plot loop time in separate window using a stacked bar chart"""
+def plot_compute_times(N, perf_logs, shield_hist, dt):
+    """Plot granular real-time performance breakdown"""
     t = np.arange(N) * dt
-    
-    fig, ax = plt.subplots(figsize=(12, 5))
-    fig.canvas.manager.set_window_title("Real-Time Performance Profiler")
-    
-    # Set the bar width to fill most of the timestep without overlapping
+    fig, ax = plt.subplots(figsize=(20, 6))
+    fig.canvas.manager.set_window_title("Performance Breakdown")
     bar_w = dt 
-    ax.bar(t, mpc_times_ms, width=bar_w, color='dodgerblue', alpha=0.8, label='MPC (Acados) Time')
-    # stack filter compute time on top of mpc compute time
-    ax.bar(t, filter_times_ms, bottom=mpc_times_ms, width=bar_w, color='darkorange', alpha=0.9, label='Shield (CasADi) Time')
+    
+    ms_mpc = perf_logs["ms_mpc"]
+    ax.bar(t, ms_mpc, width=bar_w, color='#00ecff', alpha=0.85, label='MPC (Acados)')
+    
+    # layer on top the in-filter logs and customize visuals
+    filter_layers = [
+        ("ms_attr_check", '#9200ff',        'Filter: Attr/Dim Check'),
+        ("ms_copy",       '#fde500',  'Filter: Array Copy'),
+        ("ms_map",        '#ff1300',      'Filter: Initial Map Eval'),
+        ("ms_loop",       '#6dff00',   'Filter: Iterative Loop')
+    ]
+    
+    bottom_curr = ms_mpc.copy()
+    # iterate dynamically
+    for key, color, label_text in filter_layers:
+        if key in perf_logs:
+            layer_data = perf_logs[key]
+            ax.bar(t, layer_data, bottom=bottom_curr, width=bar_w, color=color, alpha=0.9, label=label_text)
+            bottom_curr += layer_data
+            
+    # if total filter time differs from internal sum
+    if "ms_filter" in perf_logs:
+        ms_internal_sum = bottom_curr - ms_mpc
+        ms_wrapper_overhead = np.maximum(0.0, perf_logs["ms_filter"] - ms_internal_sum)
+        if np.any(ms_wrapper_overhead > 1e-4):
+            ax.bar(t, ms_wrapper_overhead, bottom=bottom_curr, width=bar_w, 
+                   color='#ffa6f2', alpha=0.7, label='Wrapper/Python Overhead')
+            bottom_curr += ms_wrapper_overhead
+
+    # Highlight active safety filter triggers
     if shield_hist is not None and np.any(shield_hist):
-        ax.plot(t[shield_hist], t[shield_hist]*0.0+0.1, 'rs', markersize=5, label='Shield Triggered')
+        ax.fill_between(t, 0, 1, where=shield_hist, color='gray', alpha=0.2, edgecolor='none',
+                        transform=ax.get_xaxis_transform(), label='Shield Active')
     
-    # 50Hz objective line
-    ax.axhline(y=20, color='red', linestyle='--', linewidth=1.5, alpha=0.6,label="50 Hz Target")
-    
+    ax.axhline(y=20, color='red', linestyle='--', linewidth=1.5, alpha=0.6, label="50 Hz Target (20ms)")
+    ax.set_xlim(t[0], t[-1])
     ax.set_xlabel('Simulation Time (s)')
     ax.set_ylabel('Execution Time (ms)')
-    ax.set_title('Compute Overhead')
-    
-    # Only show horizontal grid lines for clean bar-chart reading
+    ax.set_title('Detailed Breakdown of Compute Overhead')
     ax.grid(True, axis='y', linestyle='-', alpha=0.3)
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', fontsize='small')
     
 if __name__ == "__main__":
     run_closed_loop_mpc()

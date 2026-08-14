@@ -1,19 +1,20 @@
 import numpy as np
-import scipy.linalg
 import casadi as cs
 import os
 
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosSimSolver
+from models.fixedwing_model import FixedWingModel
 
-class FixedwingMPC:
-    def __init__(self, model, x0_init = None, N=40, Tf=2.0,trackingAttitude=False):
+class FixedWingMPC:
+    def __init__(self, model: FixedWingModel,cbf_filter=None, x0_init = None, N=40, Ts=.05,trackingAttitude=False):
         self.N = N
-        self.Tf = Tf
+        self.Ts = Ts
+        self.Tf = N*Ts
         self.model = model # this is an instance of FixedwingModel, not the AcadosModel
-
-        self.nx = self.model.get_acados_model().x.size()[0]
-        self.nu = self.model.get_acados_model().u.size()[0]
-        
+        self.acados_model = self.model.get_acados_model()
+        self.nx = self.model.get_acados_model().x.size()[0] # 8
+        self.nu = self.model.get_acados_model().u.size()[0] # 3
+        self.cbf_filter = cbf_filter
 
         # need to initialize x0_init if not provided
         if x0_init is None:
@@ -22,10 +23,17 @@ class FixedwingMPC:
             x0_init[3] = 10.0  # Initialize speed to 10 m/s
             x0_init[4] = 1.0  # Initialize quaternion w=1
         
-        self.ocp_solver, self.integrator = self.setup(x0_init, self.N, self.Tf)
+        self.ocp_solver, self.integrator = self.setup(x0_init, trackingAttitude=trackingAttitude)
+        
+        for i in range(self.N + 1):
+            self.ocp_solver.set(i, "x", x0_init)
+            if i < self.N:
+                # Give it a realistic hover/flight guess for controls (1g lift)
+                self.ocp_solver.set(i, "u", np.array([0.0, 9.81, 0.0]))
 
-    def setup(self, x0, N_horizon, Tf,trackingAttitude=False):
+    def setup(self, x0,trackingAttitude=False):
         ocp = AcadosOcp()
+        ocp.model = self.acados_model
         
         this_file_dir = os.path.dirname(os.path.abspath(__file__))
         package_root = os.path.abspath(os.path.join(this_file_dir, '..'))
@@ -33,99 +41,148 @@ class FixedwingMPC:
         json_path = os.path.join(codegen_dir, 'acados_ocp.json')
         os.makedirs(codegen_dir, exist_ok=True)
         ocp.code_export_directory = codegen_dir
-
-        model = self.model.get_acados_model()
-        ocp.model = model
-        # the model stored in self.model is an instance of FixedwingModel 
-        Fmax = self.model.max_thrust_acc
-        Lmax = self.model.max_lift_acc
-        wmax = self.model.max_roll_rate
         
-        nx = self.nx
-        nu = self.nu
-        ny = nx + nu
-        ny_e = nx
-        # COST FORMULATION (Aligned with path_following_cost.py)
+        # COST FORMULATION
         # x: [px, py, pz, speed, qw, qx, qy, qz]
-        Q_all = np.diag([2e2, 2e2, 2e2,   # Position tracking priority
-                         25.0,                  # Target airspeed tracking
-                         50.0, 50.0, 50.0, 50.0]) # Attitude
-        
-        Q_pos = np.diag([8e2,8e2,8e2, 0.0,1.0,0.0,0.0,0.0])
+        # TODO: change to cs.diag(SX([elements]))
+        # big number look bad, but technically still take the same fp64 / IEE 754? standard
+        Q_all = np.diag([1e3, 1e3, 2e3, 10.0, 50.0, 50.0, 50.0, 50.0])
+        Q_pos = np.diag([5e2, 5e2, 1e3, 0.0, 0, 0, 0, 0])
         Q_mat = Q_all if trackingAttitude else Q_pos
         # u: [thrust, lift, roll_rate]
-        R_mat = np.diag([5.0, 20.0, 20.0])    # Control effort penalties
+        R_mat = np.diag([5e2, 5e2, 2e4])    # Control effort penalties
+        # weights in a block diagonal matrix
+        ocp.cost.W = np.block([ [Q_mat, np.zeros((Q_mat.shape[0], R_mat.shape[1]))],
+                                [np.zeros((R_mat.shape[0], Q_mat.shape[1])), R_mat] ])
+        # TODO: add different terminal cost weights for better convergence
+        Q_e = None
+        # Q_e = np.diag([1e3, 1e3, 1e3, 0.0, 0.0, 0.0, 0.0, 0.0])
+        ocp.cost.W_e = Q_mat if Q_e is None else Q_e
         
         ocp.cost.cost_type = 'NONLINEAR_LS'
         ocp.cost.cost_type_e = 'NONLINEAR_LS'
-        # weights
-        ocp.cost.W = scipy.linalg.block_diag(Q_mat, R_mat)
-        # TODO: add different terminal cost weights for better convergence
-        ocp.cost.W_e = Q_mat
         
-        ocp.model.cost_y_expr = cs.vertcat(model.x, model.u)
-        ocp.model.cost_y_expr_e = model.x
+        # modify if needed
+        ocp.model.cost_y_expr = cs.vertcat(ocp.model.x, ocp.model.u)
+        ocp.model.cost_y_expr_e = ocp.model.x
         
-        ocp.cost.yref = np.zeros((ny,))
-        ocp.cost.yref_e = np.zeros((ny_e,))
+        ocp.cost.yref = np.zeros(self.nx+self.nu)
+        ocp.cost.yref_e = np.zeros(self.nx)
         
-        # CONTROL CONSTRAINTS
-        ocp.constraints.lbu = np.array([0.0, 0.1, -wmax])
-        ocp.constraints.ubu = np.array([Fmax, Lmax, wmax])
+        # ctrl constraints, self.model: FixedWingReducedModel
+        ocp.constraints.lbu = np.array([self.model.min_fxw, self.model.min_fzw, -self.model.max_roll_rate])
+        ocp.constraints.ubu = np.array([self.model.max_fxw, self.model.max_fzw, self.model.max_roll_rate])
         ocp.constraints.idxbu = np.array([0, 1, 2])
         
-        # STATE CONSTRAINTS (Stall Protection / CBF proxy)
         ocp.constraints.idxbx = np.array([3]) # Index 3 is speed
-        ocp.constraints.lbx = np.array([0.0]) # Minimum airspeed (stall limit)
-        ocp.constraints.ubx = np.array([30.0])# Max structural airspeed
-
-        ocp.constraints.x0 = x0
+        ocp.constraints.lbx = np.array([0.1]) # Minimum airspeed (stall limit)
+        ocp.constraints.ubx = np.array([45.0])# Max structural airspeed
+        
+        # make airspeed a soft constraint with slack
+        # ocp.constraints.idxsbx = np.array([0]) # speed is now first item in idxbx
+        ocp.constraints.x0 = x0 # np.zeros
+        ocp.constraints.lbu_0 = ocp.constraints.lbu
+        ocp.constraints.ubu_0 = ocp.constraints.ubu
+        ocp.constraints.idxbu_0 = ocp.constraints.idxbu
+        
+        # this is if i implemented cbf into the cost function
+        
+        if self.cbf_filter is not None:
+            cbf_expr = self.cbf_filter.get_cbf_expr(ocp.model.x, ocp.model.u)
+            ocp.model.con_h_expr = cs.vertcat(cbf_expr)  # Add the CBF constraint to the model
+            ocp.constraints.lh = np.array([self.cbf_filter.lh])
+            ocp.constraints.uh = np.array([self.cbf_filter.uh])
+            # uncomment l96~107 to make h and speed a soft constraint (for debugging only)
+            # ocp.constraints.idxsh = np.array([0])
+            # in this case we have two soft contraints
+            # ocp.cost.zl = np.array([1e5, 1e5]) # linear penalty
+            # ocp.cost.zu = np.array([1e5, 1e5])
+            # ocp.cost.Zl = np.array([1e6, 1e6]) # quadratic penalty
+            # ocp.cost.Zu = np.array([1e6, 1e6])
+        else:
+            print("Warning: No CBF safety filter provided to MPC cost.")
+            # ocp.cost.zl = np.array([1e5]) # linear penalty (lower bound)
+            # ocp.cost.zu = np.array([1e5]) # linear penalty (upper bound)
+            # ocp.cost.Zl = np.array([1e5]) # quadratic penalty
+            # ocp.cost.Zu = np.array([1e5])
 
         # SOLVER OPTIONS
-        ocp.solver_options.N_horizon = N_horizon
+        ocp.solver_options.tf = self.Tf
+        ocp.solver_options.N_horizon = self.N
         ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'
-        ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
-        ocp.solver_options.integrator_type = 'ERK'
-        ocp.solver_options.nlp_solver_type = 'SQP_RTI'
         ocp.solver_options.sim_method_num_stages = 4
         ocp.solver_options.sim_method_num_steps = 3
-        ocp.solver_options.qp_solver_cond_N = N_horizon
-        ocp.solver_options.tf = Tf
-
+        ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
+        # regularization of hessian matrix for numerical stability/ avoid det = 0
+        ocp.solver_options.integrator_type = 'ERK'
+        ocp.solver_options.nlp_solver_type = 'SQP_RTI'
+        ocp.solver_options.levenberg_marquardt = 1e-4
+        # ocp.solver_options.sim_method_jac_reuse = 1
+        ocp.solver_options.qp_solver_cond_N = self.N
         ocp_solver = AcadosOcpSolver(ocp, json_file=json_path)
+        
+        ocp.solver_options.qp_solver_warm_start = 2
+        # ocp.solver_options.nlp_solver_warm_start_first_qp = True
+        
         acados_integrator = AcadosSimSolver(ocp, json_file=json_path)
 
         return ocp_solver, acados_integrator
     
-    def solve(self, x0, yref_trajectory, verbose=False):
+    def solve(self, x0, yref_trajectory, x_warm_start=None, u_warm_start=None,verbose=True):
         """
         Receives the receding horizon trajectory (N+1 points) and updates the solver.
         """
-        ocp_solver = self.ocp_solver # Local variable aliasing for speed
-
+        ocp_solver = self.ocp_solver
+        # normalize quaternion here if i didnt do it in *_model.py
         ocp_solver.set(0, "lbx", x0)
         ocp_solver.set(0, "ubx", x0)
 
-        # Inject the lookahead trajectory
-        for i in range(self.N):
-            yref = np.zeros(self.nx + self.nu)
-            yref[0:self.nx] = yref_trajectory[i, :]
-            # Provide baseline aerodynamic targets to reduce solver effort
-            yref[8] = 0.5   # Target Thrust (allow solver to handle deviations)
-            yref[9] = 9.81  # Target Lift (roughly 1G for level flight)
-            ocp_solver.set(i, "yref", yref)
-            
-        ocp_solver.set(self.N, "yref", yref_trajectory[self.N, :])
-
+        # inject lookahead trajectory
+        if u_warm_start is not None and x_warm_start is not None:
+            for i in range(self.N):
+                u_val = u_warm_start[i, :]
+                x_val = x_warm_start[i,:]
+                ocp_solver.set(i, "u", u_val)
+                ocp_solver.set(i, "x", x_val)
+                ocp_solver.set(i, "yref", np.concatenate([yref_trajectory[i], u_val]))
+        else:
+            u_fallback = np.array([0.0, 9.81, 0.0])
+            for i in range(self.N):
+                ocp_solver.set(i, "yref", np.concatenate([yref_trajectory[i], u_fallback]))
+        ocp_solver.set(self.N, "yref", yref_trajectory[self.N])
+        
         status = ocp_solver.solve()
-        if verbose:
-            ocp_solver.print_statistics()
 
         if status != 0:
-            print(f'Warning: acados returned status {status}.')
-            print(f'Current state x0: {np.round(x0,2)}')
-            print(f'Target Ref y[0]: {np.round(yref,2)}')
-
+            print(f"\n[!] ACADOS SOLVER FAILED (Status {status})")
+            ocp_solver.print_statistics()
+            if verbose:
+                print(f"-> Initial State (x0): {np.round(x0, 3)}")
+                
+                # find stage w/ highest error btwn internal state and target
+                
+                max_error = -1
+                worst_stage = 0
+                worst_x = np.zeros(self.nx)
+                worst_target = np.zeros(self.nx)
+                
+                for k in range(self.N):
+                    x_k = ocp_solver.get(k, "x")
+                    target_k = yref_trajectory[k, :self.nx] 
+                    
+                    # euclidean distance for position (assuming px, py, pz are indices 0, 1, 2)
+                    error = np.linalg.norm(x_k[0:3] - target_k[0:3]) 
+                    
+                    if error > max_error:
+                        max_error = error
+                        worst_stage = k
+                        worst_x = x_k
+                        worst_target = target_k
+                        
+                print(f"-> Highest divergence detected at stage {worst_stage} / {self.N}")
+                print(f"   Solver's state guess: {np.round(worst_x, 3)}")
+                print(f"   Target reference:     {np.round(worst_target, 3)}")
+                print("-" * 50)
         simX = np.zeros((self.N+1, self.nx))
         simU = np.zeros((self.N, self.nu))
 
@@ -134,4 +191,4 @@ class FixedwingMPC:
             simU[i, :] = ocp_solver.get(i, "u")
         simX[self.N, :] = ocp_solver.get(self.N, "x")
 
-        return simU, simX
+        return simU, simX, status
