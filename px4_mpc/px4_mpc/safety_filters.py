@@ -2,8 +2,9 @@ import casadi as cs
 import numpy as np
 import time
 class CBFSafetyFilter:
-    def __init__(self, model, filter_mode ="HOCBF", vmin=1.0, gamma1=2.0, gamma2=2.0,beta=5.0,max_iters=10):
+    def __init__(self, model, Ts, filter_mode ="HOCBF", vmin=1.0, gamma1=2.0, gamma2=2.0,beta=5.0,max_iters=10):
         self.model = model
+        self.Ts = Ts
         self.vmin = vmin
         self.filter_mode= filter_mode
         self.gamma1 = gamma1
@@ -58,6 +59,30 @@ class CBFSafetyFilter:
                     "ms_loop": 0.0,
                     "iters"  : 0
                     }
+        
+        acados_mod = self.model.get_acados_model()        
+        x_mx = acados_mod.x            # cs.MX symbols [p, speed, q]
+        u_mx = acados_mod.u            # cs.MX symbols [f_xw, f_zw, roll_r]
+        xdot_mx = acados_mod.f_expl_expr # Exact continuous dynamics \dot{x}
+        
+        # continuous ODE function in casadi
+        f_ode = cs.Function('f_ode', [x_mx, u_mx], [xdot_mx])
+        
+        # integrate with rk4
+        dt = self.Ts
+        k1 = f_ode(x_mx, u_mx)
+        k2 = f_ode(x_mx + 0.5 * dt * k1, u_mx)
+        k3 = f_ode(x_mx + 0.5 * dt * k2, u_mx)
+        k4 = f_ode(x_mx + dt * k3, u_mx)
+        x_next = x_mx + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        
+        # normalize the quaternion
+        q_next = x_next[4:8]
+        q_next_norm = q_next / cs.sqrt(cs.sumsqr(q_next) + 1e-6)
+        x_next_safe = cs.vertcat(x_next[0:4], q_next_norm)
+        
+        # compile as C binary
+        self._step_func = cs.Function('step_dyn', [x_mx, u_mx], [x_next_safe]).expand()
         
     def get_cbf_expr(self,x,u):
         """
@@ -151,7 +176,7 @@ class CBFSafetyFilter:
         if getattr(self, '_map_N', None) != N:
             self._grad_func_map = self._grad_func.map(N)
             self._map_N = N
-            self._X_eval = cs.DM.zeros(8, N)
+            self._X_eval = cs.DM.zeros(8, N+1) # add extra for fwd prop
             self._U_eval = cs.DM.zeros(3, N)
             # speed up clipping by pre-extracting bounds
             min_b = cs.DM([self.model.min_fxw, self.model.min_fzw, -self.model.max_roll_rate])
@@ -159,17 +184,34 @@ class CBFSafetyFilter:
             # stretches the 3x1 bounds into 3xN matrices to vectorize clip
             self._min_bounds = cs.repmat(min_b, 1, N)
             self._max_bounds = cs.repmat(max_b, 1, N)
+            # unroll in casadi
+            x0_sym = cs.MX.sym('x0', 8)
+            U_seq_sym = cs.MX.sym('U_seq', 3, N)
+            
+            X_out = [x0_sym]
+            x_curr = x0_sym
+            
+            # unroll loop once
+            for k in range(N):
+                x_curr = self._step_func(x_curr, U_seq_sym[:, k])
+                X_out.append(x_curr)
+            
+            # 8x(N+1) matrix
+            X_full_sym = cs.horzcat(*X_out)
+            
+            # flattens RK4 loop for entire horizon
+            self._rollout_func = cs.Function('rollout', [x0_sym, U_seq_sym], [X_full_sym]).expand()
         t1 = time.perf_counter()
         self.last_perf_breakdown["ms_attr_check"] = (t1-t) * 1000.0
         
         # overwrite raw memory block
-        self._X_eval[:,:] = X_seq[:-1].T  # 8 by N
-        self._U_eval[:,:] = U_seq.T  # 8 by N
+        self._X_eval[:,:] = X_seq.T  # (8,N+1) # originally X_seq[:-1].T
+        self._U_eval[:,:] = U_seq.T  # (8, N)
         
         t2 = time.perf_counter()
         self.last_perf_breakdown["ms_copy"] = (t2-t1) * 1000.0
-        
-        pen_vals, grad_vals,grad_step = self._grad_func_map(self._X_eval, self._U_eval)
+        # remove last point from fwd prop for dim mismatch
+        pen_vals, grad_vals,grad_step = self._grad_func_map(self._X_eval[:,:-1], self._U_eval)
         
         t3 = time.perf_counter()
         self.last_perf_breakdown["ms_map"] = (t3-t2) * 1000.0
@@ -177,23 +219,28 @@ class CBFSafetyFilter:
         self.last_perf_breakdown["iters"] = 0
         # sum penalties across horizon into scalar
         total_penalty = float(cs.sum(pen_vals))
-        
         if total_penalty < 1e-8: 
             return np.array(self._U_eval.T),False
         # print(f"[Shield] Triggered! P_I: {total_penalty:2.3e} ", end="")
         prev_penalty = float('inf')
         beta = self.beta
+        
+        x_start = self._X_eval[:,0]
+        
         for iteration in range(self.max_iters):
             # exact projection back onto boundary of safe set:  u* - u_nom = v/(\| grad h \|^2) * grad h
             if abs (prev_penalty - total_penalty) <1e-9:
                 print(f"HARDWARE LIMIT: P_F: {total_penalty:2.3e} P_prev: {prev_penalty:2.3e}\t| {iteration+1:3d}/{self.max_iters} iters")
                 break
             prev_penalty = total_penalty
+            # gradient step of controls
             self._U_eval -= grad_vals * cs.repmat(grad_step*beta,3,1)
             self._U_eval = cs.fmin(cs.fmax(self._U_eval, self._min_bounds), self._max_bounds)
             
-            # evaluate unrolled map with casadi
-            pen_vals, grad_vals,grad_step = self._grad_func_map(self._X_eval, self._U_eval)
+            # nonlinear fwd propagation using rk4, starting at x0
+            self._X_eval = self._rollout_func(x_start, self._U_eval)
+            # reevaluate penalties (also trim _X_eval to match dims)
+            pen_vals, grad_vals,grad_step = self._grad_func_map(self._X_eval [:,:-1], self._U_eval)
             
             total_penalty = float(cs.sum(pen_vals))
             if total_penalty < 1e-8:    

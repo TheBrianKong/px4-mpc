@@ -79,7 +79,8 @@ def parametrized_ref_path_stall(s):
     """generate a path that has a steep climb to induce a stall"""
     return np.array([
         20.0*s,
-        20.0*s, # np.sin(s),
+        20.0*s, 
+        # 20.0*np.sin(s),
         25.0+ 30.0*s
     ]).T
 
@@ -134,10 +135,10 @@ def run_closed_loop_mpc(verbose = False):
     use_filter= True
     v_min = 10.0
     filter_mode = "HOCBF"
-    gamma1 = 1.0
-    gamma2 = 1.0
-    filter_max_iter = 100
-    beta = 1.0
+    gamma1 = .8
+    gamma2 = .8
+    filter_max_iter = 80
+    beta = 8.0
     # initialize slightly off the path in z-up frame
     x0 = np.zeros(8)
     density = 5000
@@ -147,7 +148,7 @@ def run_closed_loop_mpc(verbose = False):
     x0[0:3] = global_path[0] 
     x0[3] = target_velocity
     x0[4] = 1.0 
-    cbf_filter = CBFSafetyFilter(model, filter_mode, v_min, gamma1, gamma2,beta,filter_max_iter)
+    cbf_filter = CBFSafetyFilter(model, Ts, filter_mode, v_min, gamma1, gamma2,beta,filter_max_iter)
     mpc = FixedWingMPC(model, cbf_filter=cbf_filter, x0_init=x0, N=N_horizon, Ts=Ts, trackingAttitude=True)
     
     # preallocate logging arrays
@@ -594,7 +595,7 @@ def plot_compute_times(mpc_obj, cbf_obj, N, perf_logs, shield_hist):
     iters_data = perf_logs["iters"]
     ax2.axhline(y=cbf_obj.max_iters, color='k', linestyle='--', linewidth=1, alpha=1, label="Max num steps (gradient)")
     
-    ax2.plot(t, iters_data, 'k-', linewidth=1.0, alpha=0.5, label='Filter Iterations')
+    ax2.plot(t, iters_data, 'k-', linewidth=1.0, alpha=0.5, label='num steps by filter')
     ax2.set_ylabel(r"Safety Filter Gradient Steps ($n_{iters}$)")
     ax2.tick_params(axis='y', labelcolor='black')
     
