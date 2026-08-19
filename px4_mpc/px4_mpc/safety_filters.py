@@ -2,16 +2,17 @@ import casadi as cs
 import numpy as np
 import time
 class CBFSafetyFilter:
-    def __init__(self, model, Ts, filter_mode ="HOCBF", vmin=1.0, gamma1=2.0, gamma2=2.0,beta=5.0,max_iters=10):
+    def __init__(self, model, N, repair_horizon, Ts, filter_mode ="HOCBF", vmin=1.0, gamma1=2.0, gamma2=2.0,beta=5.0,max_iters=10):
         self.model = model
         self.Ts = Ts
+        self.N = N
         self.vmin = vmin
         self.filter_mode= filter_mode
         self.gamma1 = gamma1
         self.gamma2 = gamma2
         self.max_iters = max_iters
         self.beta = beta # zeno's paradox
-        
+        self.K = repair_horizon
         # hyperparams for CBF bounds
         self.lh = 0.1
         self.uh = 1e5
@@ -83,6 +84,9 @@ class CBFSafetyFilter:
         
         # compile as C binary
         self._step_func = cs.Function('step_dyn', [x_mx, u_mx], [x_next_safe]).expand()
+        # c binary to turn single-timestep input into held input across horizon
+        u_single = cs.MX.sym('u_single',3,1)
+        self._hold_input = cs.Function('hold_input', [u_single],[cs.repmat(u_single,1,N)]).expand()
         
     def get_cbf_expr(self,x,u):
         """
@@ -159,57 +163,71 @@ class CBFSafetyFilter:
         h, h_dot, cbf_val = self._eval_func(x_val, u_val)
         # not  sure if i have to typecast, but it's safe
         return float(h), float(h_dot), float(cbf_val)
-        
-    def filter_horizon(self, X_seq, U_seq):
+
+    def filter(self, x0, U_seq):
         """
-        Iterate over the entire MPC predictive horizon. 
-        Use CasADi gradients to pull/project unsafe control actions back into the safe envelope.
-        gradient descent with adaptive step size for rapid convergence
+        Safety filter that propagates any input sequence on x0 over repair horizon K
+        Minimally adjust unsafe control actions back into the safe set
+        using gradient descent with adaptive step size for faster convergence
         
         Returns:
             U_eval (np.ndarray)
-            shield_activated (bool)
+            shield_activated (bool)s
         """
         t = time.perf_counter()
-        N = U_seq.shape[0]
+        N = self.N
+        K = self.K
+        if not isinstance(U_seq, cs.DM):
+            U_seq = cs.DM(np.atleast_2d(U_seq))
+        # convert x0 to be casadi dense matrix if it's not already
+        x0_dm = cs.DM(x0) if not isinstance(x0, cs.DM) else x0
+        # hold the input if it's (3,1), otherwise use the (3,N) input provided
+        if U_seq.numel() == 3:
+            # Single control vector passed (e.g., 3x1 or 1x3) -> reshape using a tuple or single argument
+            U_seq = self._hold_input(cs.reshape(U_seq, 3, 1)) # Returns (3, N) via compiled repmat
+        else:
+            U_seq = U_seq.T if (U_seq.shape == (N, 3)) else cs.reshape(U_seq, 3, N)
+        
+        U_repair= U_seq[:,:K]
+        
         # lazy build of mapped casadi function to allow evaluation of N inputs simultaneously in C++
-        if getattr(self, '_map_N', None) != N:
-            self._grad_func_map = self._grad_func.map(N)
-            self._map_N = N
-            self._X_eval = cs.DM.zeros(8, N+1) # add extra for fwd prop
-            self._U_eval = cs.DM.zeros(3, N)
+        if getattr(self, '_map_N', None) != K:
+            self._grad_func_map = self._grad_func.map(K)
+            self._map_N = K
+            self._X_eval = cs.DM.zeros(8, K+1) # add extra for fwd prop
+            self._U_eval = cs.DM.zeros(3, K)
             # speed up clipping by pre-extracting bounds
             min_b = cs.DM([self.model.min_fxw, self.model.min_fzw, -self.model.max_roll_rate])
             max_b = cs.DM([self.model.max_fxw, self.model.max_fzw, self.model.max_roll_rate])
             # stretches the 3x1 bounds into 3xN matrices to vectorize clip
-            self._min_bounds = cs.repmat(min_b, 1, N)
-            self._max_bounds = cs.repmat(max_b, 1, N)
-            # unroll in casadi
-            x0_sym = cs.MX.sym('x0', 8)
-            U_seq_sym = cs.MX.sym('U_seq', 3, N)
+            self._min_bounds = cs.repmat(min_b, 1, K)
+            self._max_bounds = cs.repmat(max_b, 1, K)
             
+            # unroll RK4 physics in casadi once
+            x0_sym = cs.MX.sym('x0', 8)
+            U_seq_sym = cs.MX.sym('U_seq', 3, K)
             X_out = [x0_sym]
             x_curr = x0_sym
-            
-            # unroll loop once
-            for k in range(N):
+            for k in range(K):
                 x_curr = self._step_func(x_curr, U_seq_sym[:, k])
                 X_out.append(x_curr)
             
-            # 8x(N+1) matrix
+            # 8x(K+1) matrix
             X_full_sym = cs.horzcat(*X_out)
             
             # flattens RK4 loop for entire horizon
             self._rollout_func = cs.Function('rollout', [x0_sym, U_seq_sym], [X_full_sym]).expand()
+        
         t1 = time.perf_counter()
         self.last_perf_breakdown["ms_attr_check"] = (t1-t) * 1000.0
         
         # overwrite raw memory block
-        self._X_eval[:,:] = X_seq.T  # (8,N+1) # originally X_seq[:-1].T
-        self._U_eval[:,:] = U_seq.T  # (8, N)
+        self._U_eval[:,:] = U_repair # (3, K)
+        self._X_eval[:,:] = self._rollout_func(x0_dm, self._U_eval)
         
         t2 = time.perf_counter()
         self.last_perf_breakdown["ms_copy"] = (t2-t1) * 1000.0
+        
         # remove last point from fwd prop for dim mismatch
         pen_vals, grad_vals,grad_step = self._grad_func_map(self._X_eval[:,:-1], self._U_eval)
         
@@ -219,14 +237,11 @@ class CBFSafetyFilter:
         self.last_perf_breakdown["iters"] = 0
         # sum penalties across horizon into scalar
         total_penalty = float(cs.sum(pen_vals))
-        if total_penalty < 1e-8: 
-            return np.array(self._U_eval.T),False
+        if total_penalty < 1e-8:
+            return np.array(U_seq.T), total_penalty, False
         # print(f"[Shield] Triggered! P_I: {total_penalty:2.3e} ", end="")
         prev_penalty = float('inf')
         beta = self.beta
-        
-        x_start = self._X_eval[:,0]
-        
         for iteration in range(self.max_iters):
             # exact projection back onto boundary of safe set:  u* - u_nom = v/(\| grad h \|^2) * grad h
             if abs (prev_penalty - total_penalty) <1e-9:
@@ -238,7 +253,7 @@ class CBFSafetyFilter:
             self._U_eval = cs.fmin(cs.fmax(self._U_eval, self._min_bounds), self._max_bounds)
             
             # nonlinear fwd propagation using rk4, starting at x0
-            self._X_eval = self._rollout_func(x_start, self._U_eval)
+            self._X_eval = self._rollout_func(x0_dm, self._U_eval)
             # reevaluate penalties (also trim _X_eval to match dims)
             pen_vals, grad_vals,grad_step = self._grad_func_map(self._X_eval [:,:-1], self._U_eval)
             
@@ -251,7 +266,6 @@ class CBFSafetyFilter:
             self.last_perf_breakdown["ms_loop"] = (t4-t3) * 1000.0
             self.last_perf_breakdown["iters"] = iteration + 1
             
-        # else:
-            # print(f"P_F: {total_penalty:2.3e}| MAX ITER REACHED")
+        U_seq[:,:K]=self._U_eval
         # only translate back to NumPy at the very end to pass to the rest of stack
-        return np.array(self._U_eval.T), True
+        return np.array(U_seq.T), total_penalty, True

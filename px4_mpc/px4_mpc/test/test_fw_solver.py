@@ -79,7 +79,8 @@ def parametrized_ref_path_stall(s):
     """generate a path that has a steep climb to induce a stall"""
     return np.array([
         20.0*s,
-        20.0*s, 
+        20.0*s,
+        # 20.0*np.cos(s),
         # 20.0*np.sin(s),
         25.0+ 30.0*s
     ]).T
@@ -128,29 +129,29 @@ def get_paced_reference(current_state, path, last_idx, nx, N, dt, target_v):
 def run_closed_loop_mpc(verbose = False):
     """main simulation loop handling the mpc solver and acados plant integrator"""
     model = FixedWingModel()
-    N_horizon = 40
     max_sim_steps = 4000 
+    N_horizon = 40
     Ts = 0.05
     target_velocity =15.0
     use_filter= True
+    repair_horizon = 30
     v_min = 10.0
     filter_mode = "HOCBF"
     gamma1 = .8
     gamma2 = .8
-    filter_max_iter = 80
-    beta = 8.0
+    filter_max_iter = 5
+    beta = 8.5
     # initialize slightly off the path in z-up frame
     x0 = np.zeros(8)
     density = 5000
-    s_array = np.linspace(0, 4*np.pi, int(density))
+    s_array = np.linspace(0, 8*np.pi, int(density))
     # global_path = parametrized_ref_path(s_array)
     global_path = parametrized_ref_path_stall(s_array)
     x0[0:3] = global_path[0] 
     x0[3] = target_velocity
     x0[4] = 1.0 
-    cbf_filter = CBFSafetyFilter(model, Ts, filter_mode, v_min, gamma1, gamma2,beta,filter_max_iter)
-    mpc = FixedWingMPC(model, cbf_filter=cbf_filter, x0_init=x0, N=N_horizon, Ts=Ts, trackingAttitude=True)
-    
+    cbf_filter = CBFSafetyFilter(model, N_horizon, repair_horizon, Ts, filter_mode, v_min, gamma1, gamma2,beta,filter_max_iter)
+    mpc = FixedWingMPC(model, N=N_horizon, Ts=Ts, cbf_filter=cbf_filter, x0_init=x0, trackingAttitude=True)
     # preallocate logging arrays
     X_hist = np.zeros((max_sim_steps, mpc.nx))
     U_hist = np.zeros((max_sim_steps, mpc.nu))
@@ -210,7 +211,7 @@ def run_closed_loop_mpc(verbose = False):
         t_filter_call = time.perf_counter()
         
         if cbf_filter is not None and use_filter:
-            u_filter_horizon,shield_active = cbf_filter.filter_horizon(simX, simU)
+            u_filter_horizon,_ , shield_active = cbf_filter.filter(x_curr, simU)
             u_filter = u_filter_horizon[0, :]
             shield_hist[k] = shield_active
             if shield_active and verbose:
@@ -334,7 +335,7 @@ def setup_safety_subplots(fig, gs, col_idx, t, X, U, cbf_obj,shield_log=None):
     ax_speed.plot(t, X[:, 3], 'b-', label='actual airspeed')
     ax_speed.axhline(y=cbf_obj.vmin, color='r', linestyle='--', label='vmin (stall limit)')
     ax_speed.set_ylabel('airspeed (m/s)')
-    ax_speed.set_title(f"airspeed CBF stats ($\\gamma_1 = {cbf_obj.gamma1}, \\gamma_2 = {cbf_obj.gamma2})$"
+    ax_speed.set_title(f"airspeed CBF stats ($N_{{repair}}={cbf_obj.K}, \\gamma_1 = {cbf_obj.gamma1}, \\gamma_2 = {cbf_obj.gamma2})$"
                        f"\n Filter params: $\\beta={cbf_obj.beta}, N_{{steps\\;max}}={cbf_obj.max_iters}$")
     ax_speed.grid(True)
     ax_speed.legend(loc='upper right', fontsize='small')
@@ -586,7 +587,7 @@ def plot_compute_times(mpc_obj, cbf_obj, N, perf_logs, shield_hist):
     ax1.set_xlim(t[0], t[-1])
     ax1.set_xlabel('Simulation Time (s)')
     ax1.set_ylabel('Execution Time (ms)')
-    ax1.set_title(f"Detailed Breakdown of Compute Overhead\n$N_{{horizon}}= {mpc_obj.N}, T_s={dt}\\quad"
+    ax1.set_title(f"Detailed Breakdown of Compute Overhead\n$N_{{horizon}}= {mpc_obj.N}, N_{{repair}}={cbf_obj.K}, T_s={dt}\\quad"
                  f"\\gamma_1 = {cbf_obj.gamma1}, \\gamma_2 = {cbf_obj.gamma2}\\quad "
                  f"N_{{steps\\;max}}={cbf_obj.max_iters}, \\beta={cbf_obj.beta}$")
     ax1.grid(True, axis='y', linestyle='-', alpha=0.3)
