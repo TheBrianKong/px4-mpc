@@ -139,7 +139,7 @@ def run_closed_loop_mpc(verbose = False):
     filter_mode = "HOCBF"
     gamma1 = .8
     gamma2 = .8
-    filter_max_iter = 5
+    filter_max_iter = 4
     beta = 8.5
     # initialize slightly off the path in z-up frame
     x0 = np.zeros(8)
@@ -162,9 +162,9 @@ def run_closed_loop_mpc(verbose = False):
     perf_logs = {
         "ms_mpc": np.zeros(max_sim_steps),
         "ms_filter": np.zeros(max_sim_steps),
-        "ms_attr_check": np.zeros(max_sim_steps),
-        "ms_copy": np.zeros(max_sim_steps),
-        "ms_map": np.zeros(max_sim_steps),
+        "ms_format": np.zeros(max_sim_steps),
+        "ms_init_eval": np.zeros(max_sim_steps),
+        # "ms_map": np.zeros(max_sim_steps),
         "ms_loop": np.zeros(max_sim_steps),
         "iters": np.zeros(max_sim_steps, dtype=int)
     }    
@@ -221,9 +221,9 @@ def run_closed_loop_mpc(verbose = False):
             u_safe_guess[ -1, :] = u_filter_horizon[-1, :]
             
             filter_log = cbf_filter.last_perf_breakdown
-            perf_logs["ms_attr_check"][k] = filter_log["ms_attr_check"]
-            perf_logs["ms_copy"][k] = filter_log["ms_copy"]
-            perf_logs["ms_map"][k]  = filter_log["ms_map"]
+            perf_logs["ms_format"][k] = filter_log["ms_format"]
+            perf_logs["ms_init_eval"][k] = filter_log["ms_init_eval"]
+            # perf_logs["ms_map"][k]  = filter_log["ms_map"]
             perf_logs["ms_loop"][k] = filter_log["ms_loop"]
             perf_logs["iters"][k]   = filter_log["iters"]
         else:
@@ -543,14 +543,14 @@ def plot_compute_times(mpc_obj, cbf_obj, N, perf_logs, shield_hist):
     fig.canvas.manager.set_window_title("Performance Breakdown")
     
     ms_mpc = perf_logs["ms_mpc"]
-    ax1.bar(t, ms_mpc, width=dt, color='#00ecff', alpha=0.85, label='MPC (Acados)')
+    ax1.bar(t, ms_mpc, width=dt, color='#008dff', alpha=0.85, label='MPC (Acados)')
     
     # layer on top the in-filter logs and customize visuals
     filter_layers = [
-        ("ms_attr_check", '#9200ff',        'Filter: Attr/Dim Check'),
-        ("ms_copy",       '#fde500',  'Filter: Array Copy'),
-        ("ms_map",        '#ff1300',      'Filter: Initial Map Eval'),
-        ("ms_loop",       '#6dff00',   'Filter: Iterative Loop')
+        ("ms_format",   '#c701ff',  'Filter: Input Formatting'),
+        ("ms_init_eval",'#f9e858',  'Filter: Initial Safety Eval'),
+        # ("ms_map",      '#ffa6f2',  'Filter: Initial Map Eval'),
+        ("ms_loop",     '#ff73b6',  'Filter: Gradient Descent Loop')
     ]
     
     bottom_curr = ms_mpc.copy()
@@ -567,7 +567,7 @@ def plot_compute_times(mpc_obj, cbf_obj, N, perf_logs, shield_hist):
         ms_wrapper_overhead = np.maximum(0.0, perf_logs["ms_filter"] - ms_internal_sum)
         if np.any(ms_wrapper_overhead > 1e-4):
             ax1.bar(t, ms_wrapper_overhead, bottom=bottom_curr, width=dt, 
-                   color='#ffa6f2', alpha=0.7, label='Wrapper/Python Overhead')
+                   color="#00b45a", alpha=0.7, label='Wrapper/Python Overhead')
             bottom_curr += ms_wrapper_overhead
 
     # highlight active safety filter triggers
