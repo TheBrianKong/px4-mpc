@@ -137,6 +137,7 @@ def run_closed_loop_mpc(verbose = False):
     repair_horizon = 30
     v_min = 10.0
     filter_mode = "HOCBF"
+    cbf_solver_mode = "custom"
     gamma1 = .8
     gamma2 = .8
     filter_max_iter = 4
@@ -150,7 +151,8 @@ def run_closed_loop_mpc(verbose = False):
     x0[0:3] = global_path[0] 
     x0[3] = target_velocity
     x0[4] = 1.0 
-    cbf_filter = CBFSafetyFilter(model, N_horizon, repair_horizon, Ts, filter_mode, v_min, gamma1, gamma2,beta,filter_max_iter)
+    cbf_filter = CBFSafetyFilter(model, N_horizon, repair_horizon, Ts, 
+                                 filter_mode, cbf_solver_mode, v_min, gamma1, gamma2,beta,filter_max_iter)
     mpc = FixedWingMPC(model, N=N_horizon, Ts=Ts, cbf_filter=cbf_filter, x0_init=x0, trackingAttitude=True)
     # preallocate logging arrays
     X_hist = np.zeros((max_sim_steps, mpc.nx))
@@ -580,7 +582,7 @@ def plot_compute_times(mpc_obj, cbf_obj, N, perf_logs, shield_hist):
                 t_start_span = t[block[0]] - (dt / 2.0)
                 t_end_span = t[block[-1]] + (dt / 2.0)
                 
-                ax1.axvspan(t_start_span, t_end_span, color='gray', alpha=0.25, linewidth=0.5, 
+                ax1.axvspan(t_start_span, t_end_span, color='gray', alpha=0.25, linewidth=0.0, 
                            label='Shield Active' if block is blocks[0] else "")
     
     ax1.axhline(y=20, color='red', linestyle='--', linewidth=1.5, alpha=0.6, label="50 Hz Target (20ms)")
