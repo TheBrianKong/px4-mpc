@@ -137,15 +137,15 @@ def run_closed_loop_mpc(verbose = False):
     repair_horizon = 30
     v_min = 10.0
     filter_mode = "HOCBF"
-    cbf_solver_mode = "custom"
-    gamma1 = .8
-    gamma2 = .8
+    cbf_solver_mode = "acados"
+    gamma1 = 1.0
+    gamma2 = 1.0
     filter_max_iter = 4
     beta = 8.5
     # initialize slightly off the path in z-up frame
     x0 = np.zeros(8)
     density = 5000
-    s_array = np.linspace(0, 8*np.pi, int(density))
+    s_array = np.linspace(0, 12*np.pi, int(density))
     # global_path = parametrized_ref_path(s_array)
     global_path = parametrized_ref_path_stall(s_array)
     x0[0:3] = global_path[0] 
@@ -213,7 +213,7 @@ def run_closed_loop_mpc(verbose = False):
         t_filter_call = time.perf_counter()
         
         if cbf_filter is not None and use_filter:
-            u_filter_horizon,_ , shield_active = cbf_filter.filter(x_curr, simU)
+            u_filter_horizon,_ , shield_active = cbf_filter.filter(x_curr, simU,k)
             u_filter = u_filter_horizon[0, :]
             shield_hist[k] = shield_active
             if shield_active and verbose:

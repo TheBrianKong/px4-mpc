@@ -1,35 +1,60 @@
 import casadi as cs
 import numpy as np
+from acados_template import AcadosOcp, AcadosOcpSolver
 import time
+
 class CBFSafetyFilter:
-    def __init__(self, model, N, repair_horizon, Ts, filter_mode ="HOCBF", vmin=1.0, gamma1=2.0, gamma2=2.0,beta=5.0,max_iters=10):
+
+    def __init__(self, model, N, repair_horizon, Ts, filter_mode="HOCBF", solver_mode="custom", vmin=1.0, gamma1=2.0, gamma2=2.0, beta=5.0, max_iters=10):
         self.model = model
         self.Ts = Ts
         self.N = N
+        self.K = repair_horizon
         self.vmin = vmin
-        self.filter_mode= filter_mode
+        self.filter_mode = filter_mode
+        self.solver_mode = solver_mode
         self.gamma1 = gamma1
         self.gamma2 = gamma2
         self.max_iters = max_iters
-        self.beta = beta # zeno's paradox
-        self.K = repair_horizon
-        # hyperparams for CBF bounds
-        self.lh = 0.1
+        self.beta = beta
+        
+        self.lh = 1e-5
         self.uh = 1e5
-        x_sym = cs.SX.sym('x', 8)
-        u_sym = cs.SX.sym('u', 3)
         
-        speed = x_sym[3] # *_sym to denote symbolic representation
-        q = x_sym[4:8]
-        f_xw = u_sym[0]
+        self.last_perf_breakdown = {
+            "ms_format": 0.0,
+            "ms_init_eval": 0.0,
+            "ms_loop": 0.0,
+            "iters": 0
+        }
         
-        qw, qx, qy, qz = q[0], q[1], q[2], q[3]
+        self._X_eval = cs.DM.zeros(8, self.K + 1)
+        self._U_eval = cs.DM.zeros(3, self.K)
+        self._last_u_sol = np.zeros((3, self.K))
+        
+        # used for both solvers
+        self.u_min_np = np.array([self.model.min_fxw, self.model.min_fzw, -self.model.max_roll_rate])
+        self.u_max_np = np.array([self.model.max_fxw, self.model.max_fzw, self.model.max_roll_rate])
+        # for custom solver
+        self._min_bounds = cs.repmat(cs.DM(self.u_min_np), 1, self.K)
+        self._max_bounds = cs.repmat(cs.DM(self.u_max_np), 1, self.K)
+        
+        self._setup_symbolics()
+        self._setup_shared_horizon_evaluators()
+        self._setup_solver_routing()
+
+    def _get_cbf_components(self, x, u):
+        speed = x[3]
+        q = x[4:8]
+        f_xw, f_zw, roll_r = u[0], u[1], u[2]
+        
         R = cs.vertcat(
-            cs.horzcat(1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)),
-            cs.horzcat(2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)),
-            cs.horzcat(2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2))
+            cs.horzcat(1 - 2*(q[2]**2 + q[3]**2), 2*(q[1]*q[2] - q[0]*q[3]), 2*(q[1]*q[3] + q[0]*q[2])),
+            cs.horzcat(2*(q[1]*q[2] + q[0]*q[3]), 1 - 2*(q[1]**2 + q[3]**2), 2*(q[2]*q[3] - q[0]*q[1])),
+            cs.horzcat(2*(q[1]*q[3] - q[0]*q[2]), 2*(q[2]*q[3] + q[0]*q[1]), 1 - 2*(q[1]**2 + q[2]**2))
         )
         
+        speed_safe = cs.sqrt(speed**2 + 1e-8)
         # gravity projected into the wind frame (z-up)
         g_inertial = cs.vertcat(0, 0, self.model.gravity)
         g_wind = cs.mtimes(R.T, g_inertial)
@@ -37,39 +62,37 @@ class CBFSafetyFilter:
         # CBF Formulation; psi0 = h = V-Vmin
         psi0 = speed - self.vmin
         h_dot = f_xw + g_wind[0] # g_xw
-        # extract symbolic expression of cbf for solver
-        cbf_val = self.get_cbf_expr(x_sym,u_sym)
         
-        self._eval_func = cs.Function('eval_cbf', [x_sym, u_sym], [psi0, h_dot, cbf_val]).expand()
+        if self.filter_mode == "FIRST_ORDER":
+            cbf_val = h_dot + self.gamma1 * psi0
+        elif self.filter_mode == "HOCBF":
+            psi1 = h_dot + self.gamma1 * psi0
+            q_wind = -(f_zw + g_wind[2]) / speed_safe
+            r_wind = g_wind[1] / speed_safe
+            h_ddot = r_wind * g_wind[1] - q_wind * g_wind[2] + self.gamma1 * h_dot
+            cbf_val = h_ddot + self.gamma2 * psi1
+        else:
+            raise ValueError(f"bad filter mode: {self.filter_mode}")
+            
+        return psi0, h_dot, cbf_val
+
+    def get_cbf_expr(self, x, u):
+        return self._get_cbf_components(x, u)[2]
+
+    def _setup_symbolics(self):
+        self._x_sym = cs.SX.sym('x_sym', 8)
+        self._u_sym = cs.SX.sym('u_sym', 3)
         
-        # gradient for safety filter:
-        # penalty function to be smoothly differentiable and positive when cbf_val < 0
-        penalty =  0.5* cs.fmax(0, -cbf_val)**2
-        # gradient of penalty w.r.t. control input u (f_xw, f_zw, roll_rate)
-        grad_u = cs.gradient(penalty,u_sym)
+        h_sx, h_dot_sx, cbf_val_sx = self._get_cbf_components(self._x_sym, self._u_sym)
+        self._eval_func = cs.Function('eval_cbf_logged', [self._x_sym, self._u_sym], [h_sx, h_dot_sx, cbf_val_sx]).expand()
+
+        acados_model = self.model.get_acados_model()
+        x_mx = acados_model.x
+        u_mx = acados_model.u
+        xdot_mx = acados_model.f_expl_expr
         
-        grad_norm_sq = cs.sumsqr(grad_u)+1e-8 # grad_u is 3x1 vector here, so sumsqr works
-        grad_step = 2.0* penalty / grad_norm_sq # exact distance between u* and u_nom
-        # casadi function for eval, make it compile as a binary in C
-        self._grad_func = cs.Function('grad_cbf', [x_sym, u_sym], [penalty, grad_u, grad_step]).expand()
-        self._map_N = None
-        self.last_perf_breakdown = {
-                    "ms_format":0.0,
-                    "ms_init_eval": 0.0,
-                    # "ms_map" : 0.0,
-                    "ms_loop": 0.0,
-                    "iters"  : 0
-                    }
-        
-        acados_mod = self.model.get_acados_model()        
-        x_mx = acados_mod.x            # cs.MX symbols [p, speed, q]
-        u_mx = acados_mod.u            # cs.MX symbols [f_xw, f_zw, roll_r]
-        xdot_mx = acados_mod.f_expl_expr # Exact continuous dynamics \dot{x}
-        
-        # continuous ODE function in casadi
         f_ode = cs.Function('f_ode', [x_mx, u_mx], [xdot_mx])
         
-        # integrate with rk4
         dt = self.Ts
         k1 = f_ode(x_mx, u_mx)
         k2 = f_ode(x_mx + 0.5 * dt * k1, u_mx)
@@ -77,207 +100,222 @@ class CBFSafetyFilter:
         k4 = f_ode(x_mx + dt * k3, u_mx)
         x_next = x_mx + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
         
-        # normalize the quaternion
         q_next = x_next[4:8]
         q_next_norm = q_next / cs.sqrt(cs.sumsqr(q_next) + 1e-6)
         x_next_safe = cs.vertcat(x_next[0:4], q_next_norm)
         
-        # compile as C binary
         self._step_func = cs.Function('step_dyn', [x_mx, u_mx], [x_next_safe]).expand()
-        # c binary to turn single-timestep input into held input across horizon
-        u_single = cs.MX.sym('u_single',3,1)
-        self._hold_input = cs.Function('hold_input', [u_single],[cs.repmat(u_single,1,N)]).expand()
         
-        # unroll K steps of state integrator to build a tree linking future safety back to immediate U_seq
-        # \nabla_{v_{0:K}} (\sum\limits_{k=0}^{K} \min (h(f(x_k, v_k^+) - \alpha h(x_k))) [Yin et al, shield mppi]
+        u_single = cs.MX.sym('u_single', 3, 1)
+        self._hold_input = cs.Function('hold_input', [u_single], [cs.repmat(u_single, 1, self.N)]).expand()
+
+    def _setup_shared_horizon_evaluators(self):
         K = self.K
         x0_sym = cs.MX.sym('x0_full', 8)
         U_seq_sym = cs.MX.sym('U_seq_full', 3, K)
+        
         X_out = [x0_sym]
         x_curr = x0_sym
+        total_pen_sym = 0
         
-        # unroll physics (rk4)
+        # CRITICAL FIX: Evaluate penalty on the current state BEFORE stepping kinematics
         for k in range(K):
+            cbf_val_k = self.get_cbf_expr(x_curr, U_seq_sym[:, k])
+            total_pen_sym += 0.5 * cs.fmax(0, -cbf_val_k)**2
+            
             x_curr = self._step_func(x_curr, U_seq_sym[:, k])
             X_out.append(x_curr)
+            
         X_sym = cs.horzcat(*X_out)
         self._rollout_func = cs.Function('rollout', [x0_sym, U_seq_sym], [X_sym]).expand()
+        self._eval_nominal_penalty = cs.Function('eval_nom_pen', [x0_sym, U_seq_sym], [total_pen_sym]).expand()
+        
+        self._x0_sym_mx = x0_sym
+        self._U_seq_sym_mx = U_seq_sym
+        self._total_pen_sym_mx = total_pen_sym
 
-        # penalty sum
-        total_pen_sym = 0
-        for k in range(K):
-            x_k = X_sym[:, k]       
-            u_k = U_seq_sym[:, k]
-            
-            psi0, h_dot, cbf_val = self._eval_func(x_k, u_k)
-            pen_k = 0.5 * cs.fmax(0, -cbf_val)**2
-            total_pen_sym += pen_k
-
-        # casadi applies the chainrule backwwards through our integrator to get 
-        # exact jacobian wrt future too
-        grad_U_sym = cs.gradient(total_pen_sym, U_seq_sym)
-        
-        # adaptive step size, w/ exact projection distance to safe set boundary
-        grad_norm_sq = cs.sumsqr(grad_U_sym) + 1e-8
-        grad_step_sym = 2.0 * total_pen_sym / grad_norm_sq
-
-        # compile in C
-        self._total_grad_func = cs.Function(
-            'total_grad', 
-            [x0_sym, U_seq_sym], 
-            [total_pen_sym, grad_U_sym, grad_step_sym]
-        ).expand()
-        
-        self._X_eval = cs.DM.zeros(8, K + 1) 
-        self._U_eval = cs.DM.zeros(3, K)
-        
-        min_b = cs.DM([self.model.min_fxw, self.model.min_fzw, -self.model.max_roll_rate])
-        max_b = cs.DM([self.model.max_fxw, self.model.max_fzw, self.model.max_roll_rate])
-        self._min_bounds = cs.repmat(min_b, 1, K)
-        self._max_bounds = cs.repmat(max_b, 1, K)
-        
-    def get_cbf_expr(self,x,u):
-        """
-        BUild CBF symbolic to inject into acados or internal use for shield layer
-        """
-        speed = x[3]
-        q = x[4:8]
-        f_xw, f_zw, roll_r = u[0], u[1], u[2]
-        qw, qx, qy, qz = q[0], q[1], q[2], q[3]
-        
-        R = cs.vertcat(
-            cs.horzcat(1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)),
-            cs.horzcat(2*(qx*qy + qw*qz), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qw*qx)),
-            cs.horzcat(2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2))
-        )
-        
-        speed_safe = cs.sqrt(speed**2 + 1e-6)
-        g_inertial = cs.vertcat(0, 0, self.model.gravity)
-        g_wind = cs.mtimes(R.T, g_inertial)
-        
-        # psi_0 = h(x) = V - Vmin
-        psi0 = speed - self.vmin
-        # 1st order dynamics (accel)
-        h_dot = f_xw + g_wind[0]
-        
-        if self.filter_mode == "FIRST_ORDER":
-            # psi_1 (x,u) = psi_0 + alpha1 (psi_0) = dot h1 + gamma_1 * h1
-            cbf_val = h_dot + self.gamma1 * psi0
-            
-        elif self.filter_mode == "HOCBF":
-            # relative degree 2; pitch rate affects acceleration
-            # q_wind = a_lift + g_zw /V
-            psi1 = h_dot + self.gamma1 * psi0
-            q_wind = -(f_zw + g_wind[2]) / speed_safe
-            r_wind = g_wind[1] / speed_safe
-            # omega = cs.vertcat(roll_r, q_wind, r_wind)
-            
-            # def skew_symmetric(v):
-            #     return cs.vertcat(
-            #         cs.horzcat(0, -v[0], -v[1], -v[2]),
-            #         cs.horzcat(v[0], 0, v[2], -v[1]),
-            #         cs.horzcat(v[1], -v[2], 0, v[0]),
-            #         cs.horzcat(v[2], v[1], -v[0], 0)
-            #     )
-                
-            # q_dot = 0.5 * cs.mtimes(skew_symmetric(omega), q)
-            # p_dot = cs.mtimes(R, cs.vertcat(speed, 0, 0))
-            
-            # xdot = cs.vertcat(p_dot, h_dot, q_dot)
-            
-            # This is a more general expression, too much bloat
-            # h_ddot = cs.jacobian(psi1, x) @ xdot
-            # \ddot h = d/dt(g_xw) + \dot a_thrust =...
-            
-            # outer barrier psi_1
-            h_ddot = r_wind * g_wind[1] - q_wind * g_wind[2] + self.gamma1 * h_dot
-            
-            # Final Condition
-            cbf_val = h_ddot + self.gamma2 * psi1
-            
+    def _setup_solver_routing(self):
+        if self.solver_mode == "custom":
+            self._setup_custom_backend()
+        elif self.solver_mode == "acados":
+            self._setup_acados_backend()
         else:
-            raise ValueError(f"Unknown filter_mode: {self.filter_mode}")
-            
-        return cbf_val
+            raise ValueError(f"unknown solver mode: {self.solver_mode}")
+
+    def _setup_custom_backend(self):
+        grad_U_sym = cs.gradient(self._total_pen_sym_mx, self._U_seq_sym_mx)
+        grad_norm_sq = cs.sumsqr(grad_U_sym) + 1e-8
+        grad_step_sym = 2.0 * self._total_pen_sym_mx / grad_norm_sq
+
+        self._total_grad_func = cs.Function(
+            'total_grad',
+            [self._x0_sym_mx, self._U_seq_sym_mx],
+            [self._total_pen_sym_mx, grad_U_sym, grad_step_sym]
+        ).expand()
+
+    def _setup_acados_backend(self):
+        ocp = AcadosOcp()
+        ocp.model = self.model.get_acados_model()
+        
+        ocp.solver_options.N_horizon = self.K
+        ocp.solver_options.tf = self.K * self.Ts
+        
+        # Optimization
+        # The filter seeks the minimum deviation from the unsafe nominal controls that is safe
+        ocp.cost.cost_type = 'NONLINEAR_LS'
+        ocp.cost.cost_type_e = 'NONLINEAR_LS'
+        ocp.model.cost_y_expr = ocp.model.u
+        ocp.model.cost_y_expr_e = cs.MX.sym('y_e', 0, 1) # No terminal cost
+        
+        # # Enforce severe penalty on changing roll rate (1e4) to mirror the "masking" behavior
+        ocp.cost.W = np.diag([1.0, 1.0, 1.0]) 
+        ocp.cost.W_e = np.zeros((0, 0))
+        ocp.cost.yref = np.zeros(3) 
+        ocp.cost.yref_e = np.zeros(0)
+        
+        # hard constraints for hardware
+        ocp.constraints.lbu = self.u_min_np
+        ocp.constraints.ubu = self.u_max_np
+        ocp.constraints.idxbu = np.array([0, 1, 2])
+        ocp.constraints.x0 = np.zeros(8)
+        
+        # hard constraint for CBF
+        cbf_expr = self.get_cbf_expr(ocp.model.x, ocp.model.u)
+        ocp.model.con_h_expr = cs.vertcat(cbf_expr)
+        ocp.constraints.lh = np.array([0.0]) # Hard boundary. >= 0
+        ocp.constraints.uh = np.array([self.uh])
+        
+        #no idxsh slack block here for absolute safety
+
+        ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'
+        ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
+        ocp.solver_options.integrator_type = 'ERK'
+        ocp.solver_options.nlp_solver_type = 'SQP_RTI'# 'SQP_RTI'
+        # ocp.solver_options.nlp_solver_max_iter = 5 # self.max_iters
+        ocp.solver_options.sim_method_num_stages = 4
+        ocp.solver_options.sim_method_num_steps = 1
+        ocp.solver_options.qp_solver_warm_start = 2
+        
+        ocp.code_export_directory = 'cbf_shield_c_generated_code'
+        self.qp_solver = AcadosOcpSolver(ocp, json_file='cbf_shield_acados_ocp.json')
 
     def evaluate_cbf(self, x_val, u_val):
-        """
-        Evaluate the CBF condition purely using CasADi for logging/plotting.
-        Returns:
-            h: CBF (scalar) value function
-            h_dot: Time derivative of CBF
-            cbf_val: condition value: h_dot(x, u) + gamma_cbf * h(x), >= 0 for safety
-        """
-        h, h_dot, cbf_val = self._eval_func(x_val, u_val)
-        # not  sure if i have to typecast, but it's safe
-        return float(h), float(h_dot), float(cbf_val)
+        h, h_dot, val = self._eval_func(x_val, u_val)
+        return float(h), float(h_dot), float(val)
 
-    def filter(self, x0, U_seq):
-        """
-        Safety filter propagates input (U_seq) on initial state (x0) over repair horizon K < N:
-        - U_seq: input sequence or a (3,1) manual input evaluated as constant over horizon
-        - Use precompiled backpropagation-through-time graph to extract analytical gradient of cumsum penalty
-            - chain rule via system dynamics done through BPTT or adjoint sensitivity analysis
-        - preemptive adjustment of immediate & future ctrl actions w/ gradient descent + adaptive step size
-        
-        Returns:
-            U_eval (np.ndarray)
-            shield_activated (bool)s
-        """
-        t = time.perf_counter()
-        N = self.N
-        K = self.K
-        if not isinstance(U_seq, cs.DM):
-            U_seq = cs.DM(np.atleast_2d(U_seq))
-        # convert x0 to be casadi dense matrix if it's not already
-        x0_dm = cs.DM(x0) if not isinstance(x0, cs.DM) else x0
-        
-        # hold the input if it's (3,1), otherwise use the (3,N) input provided
-        if U_seq.numel() == 3: # single (3,1) or (1,3)
-            U_seq = self._hold_input(cs.reshape(U_seq, 3, 1)) # Returns (3, N) via compiled repmat
-        else:
-            U_seq = U_seq.T if (U_seq.shape == (N, 3)) else cs.reshape(U_seq, 3, N)
-        
-        self._U_eval= U_seq[:,:K]
-        
-        t1 = time.perf_counter()
-        self.last_perf_breakdown["ms_format"] = (t1-t) * 1000.0
-        
+    def _run_custom_optimizer(self, x0_dm, total_penalty, sim_step):
+        # calculate initial gradients before iterating
         total_penalty_mx, grad_U_mx, grad_step_mx = self._total_grad_func(x0_dm, self._U_eval)
         total_penalty = float(total_penalty_mx)
         
-        t2 = time.perf_counter()
-        self.last_perf_breakdown["ms_init_eval"] = (t2-t1) * 1000.0
-        
-        # t3 = time.perf_counter()
-        # self.last_perf_breakdown["ms_map"] = (t3-t2) * 1000.0
-        self.last_perf_breakdown["ms_loop"] = 0.0
-        self.last_perf_breakdown["iters"] = 0
-        # sum penalties across horizon into scalar
-        total_penalty = float(total_penalty_mx)
-        if total_penalty < 1e-8:
-            return np.array(U_seq.T), total_penalty, False
+        if total_penalty == 0.0:
+            return 0, 0.0
+            
         prev_penalty = float('inf')
-        beta = self.beta
+        iteration = 0
+        
         for iteration in range(self.max_iters):
-            # BPTT gradient step nudges U_seq away from future violations
-            if abs (prev_penalty - total_penalty) <1e-9:
-                print(f"HARDWARE LIMIT: P_F: {total_penalty:2.3e} P_prev: {prev_penalty:2.3e}\t| {iteration+1:3d}/{self.max_iters} iters")
+            if abs(prev_penalty - total_penalty) < 1e-9:
                 break
             prev_penalty = total_penalty
-            # gradient step of controls; the more they contribute to violation, the more they're adjusted
-            self._U_eval -= grad_U_mx * (grad_step_mx*beta)
+            
+            self._U_eval -= grad_U_mx * (grad_step_mx * self.beta)
             self._U_eval = cs.fmin(cs.fmax(self._U_eval, self._min_bounds), self._max_bounds)
             
-            # reevaluate penalties (also trim _X_eval to match dims)
             total_penalty_mx, grad_U_mx, grad_step_mx = self._total_grad_func(x0_dm, self._U_eval)
             total_penalty = float(total_penalty_mx)
             
-            if total_penalty < 1e-8:
+            if total_penalty == 0.0:
                 break
+                
+        return iteration + 1, total_penalty
+
+    def _run_acados_qp_optimizer(self, x0_flat, x0_dm, sim_step):
+        # initialize solver to x0
+        self.qp_solver.set(0, "lbx", x0_flat)
+        self.qp_solver.set(0, "ubx", x0_flat)
+        
+        # Roll out the current inputs to warm-start the state guesses
+        x_guess = self._rollout_func(x0_dm, self._U_eval)
+        
+        # Push controls back 1 index and duplicate the last stage to warm-start inputs
+        shifted_u = np.hstack([self._last_u_sol[:, 1:], self._last_u_sol[:, -1:]])
+        
+        for k in range(self.K):
+            # target reference is the nominal control sequence
+            u_nom_k = np.array(self._U_eval[:, k]).flatten()
+            u_warm_k = shifted_u[:, k]
+            x_guess_k = np.array(x_guess[:, k]).flatten()
+            x_guess_k[4:8] /= np.linalg.norm(x_guess_k[4:8])
+            self.qp_solver.set(k, "x", x_guess_k)
+            self.qp_solver.set(k, "u", u_warm_k)
+            self.qp_solver.set(k, "yref", u_nom_k)
+            
+        self.qp_solver.set(self.K, "x", np.array(x_guess[:, self.K]).flatten())
+        status = self.qp_solver.solve()
+        
+        if status != 0:
+            # hard constraint proved infeasible.
+            print(f"[t={sim_step*self.Ts:4.2f}]\tCBF Acados Failed (Status {status}). Running last accepted input")
+            self._U_eval = cs.DM(shifted_u)
+        else:
+            # Map the corrected controls back to the internal tensor
+            for k in range(self.K):
+                solved_u = self.qp_solver.get(k, "u")
+                self._U_eval[:, k] = solved_u
+                self._last_u_sol[:, k] = solved_u
+                
+        # Calculate trailing penalty purely for logging accuracy
+        total_penalty = float(self._eval_nominal_penalty(x0_dm, self._U_eval))
+        
+        self._U_eval = cs.fmin(cs.fmax(self._U_eval, self._min_bounds), self._max_bounds)
+        return 1, total_penalty
+
+    def filter(self, x0, U_seq, sim_step=-1):
+        t = time.perf_counter()
+        
+        x0_dm = cs.DM(x0) if not isinstance(x0, cs.DM) else x0
+        
+        if not isinstance(U_seq, cs.DM):
+            U_seq = cs.DM(np.atleast_2d(U_seq))
+            
+        if U_seq.numel() == 3:
+            U_seq = self._hold_input(cs.reshape(U_seq, 3, 1))
+        else:
+            U_seq = U_seq.T if (U_seq.shape == (self.N, 3)) else cs.reshape(U_seq, 3, self.N)
+        
+        self._U_eval = U_seq[:, :self.K]
+        t1 = time.perf_counter()
+        self.last_perf_breakdown["ms_format"] = (t1 - t) * 1000.0
+        
+        # fast pre-check without computing unused gradients
+        total_penalty = float(self._eval_nominal_penalty(x0_dm, self._U_eval))
+        
+        t2 = time.perf_counter()
+        self.last_perf_breakdown["ms_init_eval"] = (t2 - t1) * 1000.0
+        self.last_perf_breakdown["ms_loop"] = 0.0
+        self.last_perf_breakdown["iters"] = 0
+        
+        if total_penalty == 0:
+            self._U_eval = cs.fmin(cs.fmax(self._U_eval, self._min_bounds), self._max_bounds)
+            U_seq[:, :self.K] = self._U_eval
+            self.last_perf_breakdown["ms_format"] += (time.perf_counter() - t2) * 1000.0
+            return np.array(U_seq.T), total_penalty, False
+
+        if self.solver_mode == "custom":
+            iters_run, total_penalty = self._run_custom_optimizer(x0_dm, total_penalty, sim_step)
+        elif self.solver_mode == "acados":
+            x0_flat = np.array(x0_dm).flatten()
+            iters_run, total_penalty = self._run_acados_qp_optimizer(x0_flat, x0_dm, sim_step)
+        else:
+            raise NotImplementedError(f"bad solver mode: {self.solver_mode}")
+            
         t4 = time.perf_counter()
-        self.last_perf_breakdown["ms_loop"] = (t4-t2) * 1000.0
-        self.last_perf_breakdown["iters"] = iteration + 1
-        U_seq[:,:K]=self._U_eval
-        # only translate back to NumPy at the very end to pass to the rest of stack
+        self.last_perf_breakdown["ms_loop"] = (t4 - t2) * 1000.0
+        self.last_perf_breakdown["iters"] = iters_run
+        
+        self._U_eval = cs.fmin(cs.fmax(self._U_eval, self._min_bounds), self._max_bounds)
+        U_seq[:, :self.K] = self._U_eval
+        self.last_perf_breakdown["ms_format"] += (time.perf_counter() - t4) * 1000.0
+        
         return np.array(U_seq.T), total_penalty, True

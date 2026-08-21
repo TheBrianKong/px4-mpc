@@ -76,7 +76,7 @@ class FixedWingMPC:
         
         ocp.constraints.idxbx = np.array([3]) # Index 3 is speed
         ocp.constraints.lbx = np.array([0.1]) # Minimum airspeed (stall limit)
-        ocp.constraints.ubx = np.array([45.0])# Max structural airspeed
+        ocp.constraints.ubx = np.array([70.0])# Max structural airspeed
         
         # make airspeed a soft constraint with slack
         # ocp.constraints.idxsbx = np.array([0]) # speed is now first item in idxbx
@@ -142,6 +142,8 @@ class FixedWingMPC:
             for i in range(self.N):
                 u_val = u_warm_start[i, :]
                 x_val = x_warm_start[i,:]
+                # gotta do this to keep dynamics in solver clean + not explode
+                x_val[4:8] /= (np.linalg.norm(x_val[4:8]) + 1e-8)
                 ocp_solver.set(i, "u", u_val)
                 ocp_solver.set(i, "x", x_val)
                 ocp_solver.set(i, "yref", np.concatenate([yref_trajectory[i], u_val]))
@@ -154,13 +156,13 @@ class FixedWingMPC:
         status = ocp_solver.solve()
 
         if status != 0:
-            print(f"\n[!] ACADOS SOLVER FAILED (Status {status})")
+            print(f"\n[!] MPC ACADOS SOLVER FAILED (Status {status})")
             ocp_solver.print_statistics()
             if verbose:
                 print(f"-> Initial State (x0): {np.round(x0, 3)}")
                 
                 # find stage w/ highest error btwn internal state and target
-                
+                print(f"\t\tquaternion check: {np.linalg.norm(x0[4:8])}")
                 max_error = -1
                 worst_stage = 0
                 worst_x = np.zeros(self.nx)
@@ -181,6 +183,7 @@ class FixedWingMPC:
                         
                 print(f"-> Highest divergence detected at stage {worst_stage} / {self.N}")
                 print(f"   Solver's state guess: {np.round(worst_x, 3)}")
+                print(f"\t\tquaternion check: {np.linalg.norm(worst_x[4:8])}")
                 print(f"   Target reference:     {np.round(worst_target, 3)}")
                 print("-" * 50)
         simX = np.zeros((self.N+1, self.nx))
