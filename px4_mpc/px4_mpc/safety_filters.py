@@ -44,6 +44,7 @@ class CBFSafetyFilter:
         self._setup_solver_routing()
 
     def _get_cbf_components(self, x, u):
+        """this was for CT-CBFs"""
         speed = x[3]
         q = x[4:8]
         f_xw, f_zw, roll_r = u[0], u[1], u[2]
@@ -76,16 +77,62 @@ class CBFSafetyFilter:
             
         return psi0, h_dot, cbf_val
 
+    def _get_dcbf_components(self, x, u):
+        """
+        Evaluate DT CBF components
+        
+        Returns:
+            h_k: h(x_k) = V_a - vmin, value of the value function
+            d_h: d_h = h(x_k+1) - h(x_k), finite difference btwn steps
+            cbf_val: cbf condition bound
+            - 1st order CBF: h_dot + gamma h(x) \ge 0
+            - HOCBF: h_ddot + (gamma1 + gamma2) h_dot + gamma1*gamma2*h \ge 0
+        CT: 
+        h = V - Vmin
+        h_dot  = g_xw + f_xw/m
+        psi0 = h(x) = V - Vmin (for HOCBF)
+        1st order CBF cond: h_dot + gamma1*h(x) \ge 0
+        psi1 = psi0_dot + alpha1(psi0) = h_dot + gamma1*h
+        HOCBF condition: psi1_dot + alpha2(psi1) \ge 0
+        
+        class k functions:
+        - alpha1(psi0) = gamma1 * h(x), psi0 = h
+        - alpha2(psi1) = gamma2 * psi1
+        """
+        # map gamma inputs to discrete class-k decay parameters beta / alpha in (0, 0.95)
+        # alpha = 1- gamma*Ts
+        beta1 = cs.fmin(cs.fmax(1.0 - self.gamma1 * self.Ts, 0.0), 0.99)
+        beta2 = cs.fmin(cs.fmax(1.0 - self.gamma2 * self.Ts, 0.0), 0.99)
+        
+        h_k = x[3] - self.vmin
+        # 1 step with rk4
+        x_next = self._step_func(x, u)
+        h_next = x_next[3] - self.vmin
+        d_h = h_next - h_k # finite difference
+        # DT 1st order condition: h(x_k+1) - (1 - alpha1)*h(x_k) >= 0 -> equivalent to d_h + alpha1*h_k >= 0
+        psi1_k = d_h+ beta1 * h_k
+        
+        if self.filter_mode == "FIRST_ORDER":
+            cbf_val = psi1_k # compare (18) vs (24) in paper
+        elif self.filter_mode == "HOCBF":
+            # predict 2 steps into the future for higher relative degree
+            x_next2 = self._step_func(x_next, u)
+            h_next2 = x_next2[3] - self.vmin
+            d_h2 = h_next2 - h_next
+            # evaluate psi1 one step ahead
+            psi1_next = d_h2 + beta1 * h_next
+            # discrete hocbf condition bound
+            cbf_val = psi1_next - beta2 * psi1_k
+        else:
+            raise ValueError(f"bad filter mode: {self.filter_mode}")
+            
+        return h_k, d_h, cbf_val
+
     def get_cbf_expr(self, x, u):
-        return self._get_cbf_components(x, u)[2]
+        return self._get_dcbf_components(x, u)[2]
 
     def _setup_symbolics(self):
-        self._x_sym = cs.SX.sym('x_sym', 8)
-        self._u_sym = cs.SX.sym('u_sym', 3)
-        
-        h_sx, h_dot_sx, cbf_val_sx = self._get_cbf_components(self._x_sym, self._u_sym)
-        self._eval_func = cs.Function('eval_cbf_logged', [self._x_sym, self._u_sym], [h_sx, h_dot_sx, cbf_val_sx]).expand()
-
+        # build the rk4 integrator first so it can be utilized by the dcbf evaluator
         acados_model = self.model.get_acados_model()
         x_mx = acados_model.x
         u_mx = acados_model.u
@@ -105,6 +152,13 @@ class CBFSafetyFilter:
         x_next_safe = cs.vertcat(x_next[0:4], q_next_norm)
         
         self._step_func = cs.Function('step_dyn', [x_mx, u_mx], [x_next_safe]).expand()
+        
+        # use mx symbolics to avoid casadi type mismatches with the integrator
+        self._x_sym = cs.MX.sym('x_sym', 8)
+        self._u_sym = cs.MX.sym('u_sym', 3)
+        
+        h_mx, h_next_mx, cbf_val_mx = self._get_dcbf_components(self._x_sym, self._u_sym)
+        self._eval_func = cs.Function('eval_cbf_logged', [self._x_sym, self._u_sym], [h_mx, h_next_mx, cbf_val_mx]).expand()
         
         u_single = cs.MX.sym('u_single', 3, 1)
         self._hold_input = cs.Function('hold_input', [u_single], [cs.repmat(u_single, 1, self.N)]).expand()
