@@ -195,3 +195,12 @@ class FixedWingMPC:
         simX[self.N, :] = ocp_solver.get(self.N, "x")
 
         return simU, simX, status
+
+    def solve_null(self, x0, yref_trajectory, x_warm_start=None, u_warm_start=None,verbose=True):
+            """
+            empty solve function
+            """
+            simX = np.zeros((self.N+1, self.nx))
+            simU = np.zeros((self.N, self.nu))
+            
+            return simU, simX, 0

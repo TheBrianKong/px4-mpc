@@ -100,17 +100,19 @@ class CBFSafetyFilter:
         - alpha2(psi1) = gamma2 * psi1
         """
         # map gamma inputs to discrete class-k decay parameters beta / alpha in (0, 0.95)
-        # alpha = 1- gamma*Ts
-        beta1 = cs.fmin(cs.fmax(1.0 - self.gamma1 * self.Ts, 0.0), 0.99)
-        beta2 = cs.fmin(cs.fmax(1.0 - self.gamma2 * self.Ts, 0.0), 0.99)
+        # \dot h(x) \ge -gamma h(x) ⇒ \dot h(x) \approx (h(x_{k+1}) - h(x_k))/Ts \ge -gamma h(x_k)
+        # h(x_{k+1}) - h(x_k) \ge -gamma*T_s*h(x_k) ⇒ h(x_k) \ge (I - beta) * h(x_{k-1}), beta= gamma*T_s
+        # alpha = 1-beta. beta \in (0,1) 
+        alpha1 = cs.fmin(cs.fmax(1.0 - self.gamma1 * self.Ts, 1e-4), 1-1e-4)
+        alpha2 = cs.fmin(cs.fmax(1.0 - self.gamma2 * self.Ts, 1e-4), 1-1e-4)
         
         h_k = x[3] - self.vmin
         # 1 step with rk4
         x_next = self._step_func(x, u)
         h_next = x_next[3] - self.vmin
         d_h = h_next - h_k # finite difference
-        # DT 1st order condition: h(x_k+1) - (1 - alpha1)*h(x_k) >= 0 -> equivalent to d_h + alpha1*h_k >= 0
-        psi1_k = d_h+ beta1 * h_k
+        # DT 1st order condition: h(x_k+1) - (1 - beta1)*h(x_k) >= 0 -> equivalent to d_h + beta1*h_k >= 0
+        psi1_k = h_next+ alpha1 * h_k
         
         if self.filter_mode == "FIRST_ORDER":
             cbf_val = psi1_k # compare (18) vs (24) in paper
@@ -118,11 +120,11 @@ class CBFSafetyFilter:
             # predict 2 steps into the future for higher relative degree
             x_next2 = self._step_func(x_next, u)
             h_next2 = x_next2[3] - self.vmin
-            d_h2 = h_next2 - h_next
+            # d_h2 = h_next2 - h_next
             # evaluate psi1 one step ahead
-            psi1_next = d_h2 + beta1 * h_next
+            psi1_next = h_next2 + alpha1 * h_next
             # discrete hocbf condition bound
-            cbf_val = psi1_next - beta2 * psi1_k
+            cbf_val = psi1_next - alpha2 * psi1_k
         else:
             raise ValueError(f"bad filter mode: {self.filter_mode}")
             

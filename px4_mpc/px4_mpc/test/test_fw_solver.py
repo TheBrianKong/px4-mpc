@@ -20,6 +20,23 @@ def quat_to_R(q):
         [2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx**2 + qy**2)]
     ])
 
+def euler_to_quaternion(roll, pitch, yaw):
+    """
+    Convert Euler angles (in radians) to a quaternion [qw, qx, qy, qz].
+    """
+    cy = np.cos(yaw * 0.5)
+    sy = np.sin(yaw * 0.5)
+    cp = np.cos(pitch * 0.5)
+    sp = np.sin(pitch * 0.5)
+    cr = np.cos(roll * 0.5)
+    sr = np.sin(roll * 0.5)
+
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+
+    return np.array([qw, qx, qy, qz])
 
 def parametrized_ref_path(s):
     """generates a 3d reference point or array of points based on the parameter s"""
@@ -126,6 +143,10 @@ def get_paced_reference(current_state, path, last_idx, nx, N, dt, target_v):
             
     return ref_horizon, c_idx, False
 
+def get_raw_command(yes, default):
+    """return raw cmd if yes, otherwise default cmd"""
+    return np.array([6.0, 9.8, 0.0]) if yes else default
+
 def run_closed_loop_mpc(verbose = False):
     """main simulation loop handling the mpc solver and acados plant integrator"""
     model = FixedWingModel()
@@ -137,7 +158,8 @@ def run_closed_loop_mpc(verbose = False):
     repair_horizon = 30
     v_min = 10.0
     filter_mode = "HOCBF"
-    cbf_solver_mode = "acados"
+    cbf_solver_mode = "custom"
+    useRawCmd= True
     gamma1 = 1.0
     gamma2 = 1.0
     filter_max_iter = 4
@@ -145,12 +167,12 @@ def run_closed_loop_mpc(verbose = False):
     # initialize slightly off the path in z-up frame
     x0 = np.zeros(8)
     density = 5000
-    s_array = np.linspace(0, 12*np.pi, int(density))
+    s_array = np.linspace(0, 8*np.pi, int(density))
     # global_path = parametrized_ref_path(s_array)
     global_path = parametrized_ref_path_stall(s_array)
     x0[0:3] = global_path[0] 
     x0[3] = target_velocity
-    x0[4] = 1.0 
+    x0[4:8] = euler_to_quaternion(0.0, -np.pi/3, np.pi/4) 
     cbf_filter = CBFSafetyFilter(model, N_horizon, repair_horizon, Ts, 
                                  filter_mode, cbf_solver_mode, v_min, gamma1, gamma2,beta,filter_max_iter)
     mpc = FixedWingMPC(model, N=N_horizon, Ts=Ts, cbf_filter=cbf_filter, x0_init=x0, trackingAttitude=True)
@@ -213,7 +235,7 @@ def run_closed_loop_mpc(verbose = False):
         t_filter_call = time.perf_counter()
         
         if cbf_filter is not None and use_filter:
-            u_filter_horizon,_ , shield_active = cbf_filter.filter(x_curr, simU,k)
+            u_filter_horizon,_ , shield_active = cbf_filter.filter(x_curr, get_raw_command(useRawCmd,simU),k)
             u_filter = u_filter_horizon[0, :]
             shield_hist[k] = shield_active
             if shield_active and verbose:
