@@ -4,6 +4,7 @@ warnings.filterwarnings("ignore", message=".*AcadosSimSolver is created from an 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button
+from matplotlib.patches import Patch
 import sys
 import os
 
@@ -127,7 +128,8 @@ class SimulationCase:
     def init_plots(self, ax_3d, axs_2d, color, t_array):
         self.color = color
         
-        self.flown_line, = ax_3d.plot([], [], [], color=color, linewidth=1.0, label=self.label,linestyle = self.linestyle)
+        self.flown_line, = ax_3d.plot([], [], [], color=color, linewidth=1.0, 
+                                      label=self.label,linestyle = self.linestyle)
         self.current_pt, = ax_3d.plot([], [], [], 'o', markersize=6, color=color)
         
         ax_fxw, ax_fzw, ax_roll, ax_speed, ax_margin, ax_cbf = axs_2d
@@ -140,9 +142,11 @@ class SimulationCase:
         ax_cbf.plot(t_array, self.cbf_log, color=color, linestyle = self.linestyle)
         
         # apply the safety shading to all 6 subplots dynamically
+        hatch_pattern = '///' if self.solver_mode== "custom" else "--"
         if np.any(self.shield_log):
             for ax in axs_2d:
-                ax.fill_between(t_array, 0, 1, where=self.shield_log, color=color, alpha=0.1, transform=ax.get_xaxis_transform())
+                ax.fill_between(t_array, 0, 1, where=self.shield_log, color=color, 
+                                alpha=0.1, hatch=hatch_pattern, transform=ax.get_xaxis_transform())
         
         self.vlines = [
             ax.axvline(x=0, color='black', linestyle='--', linewidth=0.8, alpha=0.8) for ax in axs_2d
@@ -193,12 +197,15 @@ def build_dashboard(cases, model, max_steps, Ts, N_horizon):
     colors = ['#FF0505', "#00BDBD", "#5CB800", '#8205FF', '#FF9805', "#CA00A9"]
     
     for idx, case in enumerate(cases):
-        case.init_plots(ax_3d, axes_2d, colors[idx % len(colors)], t_array)
+        color_idx = idx //2
+        case.init_plots(ax_3d, axes_2d, colors[color_idx % len(colors)], t_array)
         
     all_x = np.concatenate([c.X[:, 0] for c in cases])
     all_y = np.concatenate([c.X[:, 1] for c in cases])
     all_z = np.concatenate([c.X[:, 2] for c in cases])
-    mid_x, mid_y, mid_z = np.mean([all_x.min(), all_x.max()]), np.mean([all_y.min(), all_y.max()]), np.mean([all_z.min(), all_z.max()])
+    mid_x = np.mean([all_x.min(), all_x.max()])
+    mid_y = np.mean([all_y.min(), all_y.max()]) 
+    mid_z = np.mean([all_z.min(), all_z.max()])
     max_range = np.max([all_x.max() - all_x.min(), all_y.max() - all_y.min(), all_z.max() - all_z.min()]) / 2.0
     
     ax_3d.set_xlim(mid_x - max_range, mid_x + max_range)
@@ -207,9 +214,14 @@ def build_dashboard(cases, model, max_steps, Ts, N_horizon):
     
     # inject n, ts, and tf into the title
     ax_3d.set_title(f"3d flight paths & orientations\nN={N_horizon}, Ts={Ts}s, Tf={Tf:.2f}s")
+    handles,labels = ax_3d.get_legend_handles_labels()
     
-    # legend pushed outside and forced to monospace
-    ax_3d.legend(loc='upper left', bbox_to_anchor=(.6, 1.0), prop={'size': 'medium'})
+    custom_patch = Patch(facecolor='gray', alpha=0.3, hatch='///', label='[custom] filter active')
+    acados_patch = Patch(facecolor='gray', alpha=0.3, hatch='--', label='[acados] filter active')
+
+    handles.extend([custom_patch, acados_patch])
+
+    ax_3d.legend(handles=handles, loc='upper left', bbox_to_anchor=(.6, 1.0))#, prop={'size': 'small'})
 
     ax_fxw.set_title('thrust cmd (f_xw)')
     ax_fxw.axhline(model.max_fxw, color='k', linestyle='-', alpha=0.25, label='_nolegend_')
@@ -283,7 +295,7 @@ def build_dashboard(cases, model, max_steps, Ts, N_horizon):
     plt.show()
 
 if __name__ == "__main__":
-    max_steps = 400
+    max_steps = 1000
     Ts = 0.05
     N_horizon = 40
     K_repair = 30
@@ -292,8 +304,10 @@ if __name__ == "__main__":
     
     print("compiling acados solvers...")
     mpc_solver = FixedWingMPC(model, N=N_horizon, Ts=Ts, cbf_filter=None, x0_init=np.zeros(8))
-    cbf_custom = CBFSafetyFilter(model, N_horizon, K_repair, Ts, filter_mode="HOCBF", solver_mode="custom", vmin=v_min, gamma1=1.0, gamma2=1.0, beta=8.5, max_iters=8)
-    cbf_acados = CBFSafetyFilter(model, N_horizon, K_repair, Ts, filter_mode="HOCBF", solver_mode="acados", vmin=v_min, gamma1=1.0, gamma2=1.0, beta=8.5, max_iters=8)
+    cbf_custom = CBFSafetyFilter(model, N_horizon, K_repair, Ts, filter_mode="HOCBF", solver_mode="custom", 
+                                 vmin=v_min, gamma1=1.0, gamma2=1.0, beta=8.5, max_iters=8)
+    cbf_acados = CBFSafetyFilter(model, N_horizon, K_repair, Ts, filter_mode="HOCBF", solver_mode="acados", 
+                                 vmin=v_min, gamma1=1.0, gamma2=1.0, beta=8.5, max_iters=8)
     print("compilation complete. running cases...")
     
     cases = []
@@ -301,18 +315,26 @@ if __name__ == "__main__":
     
     # roll pitch yaw angles in degrees
     rpy_angles = [
-        [0, -15, 10],
-        [0, -30, 10],
-        [0, -45, 10],
-        [0, -60, 10]
+        [0, -15, 80],
+        [0, -15, 80],
+        [0, -30, 80],
+        [0, -30, 80],
+        [0, -45, 80],
+        [0, -45, 80],
+        [0, -60, 80],
+        [0, -60, 80]
     ]
 
     # parallel array for wind parameters [dist_k, dist_dv]
     wind_params = [
+        [ 0, 0.0],
         [ 1, 5.0],
+        [ 0, 0.0],
         [ 1, 5.0],
+        [ 0, 0.0],
         [ 1, 5.0],
-        [ 1, 5.0]
+        [ 0, 0.0],
+        [ 1, 5.0],
     ]
     
     for rpy, wind in zip(rpy_angles, wind_params):
